@@ -245,7 +245,73 @@ python benchmark/bench_app.py --server 192.168.1.10   # تست مدل از یک 
 
 نکته: اگر در کنسول قدیمی ویندوز متن فارسی به‌هم ریخت، اول `chcp 65001` را اجرا کنید یا از Windows Terminal / PowerShell 7 استفاده کنید.
 
-## ۸) عیب‌یابی
+> نتیجه تست واقعی روی سرور هدف (آبان ۱۴۰۵): میانگین سرعت **۴.۳ توکن/ثانیه** (TTFT حدود ۴ ثانیه، لود سرد ۱۱ ثانیه) و کیفیت فارسی **۲۳ از ۲۳** — کیفیت فارسی عالی است؛ سرعت با چت استریم تجربه روانی دارد و برای پاسخ سریع‌تر می‌توانید `qwen3:4b` را هم امتحان کنید.
+
+## ۸) چت وب آنلاین و API با توکن (پورت 8093)
+
+برنامه [chat_server/chat_server.py](chat_server/chat_server.py) یک **چت وب فارسی** با پاسخ استریمی به‌همراه **API سازگار با OpenAI و سیستم توکن** ارائه می‌دهد — فقط پایتون استاندارد، بدون نصب هیچ پکیجی.
+
+### اجرای سریع (تست)
+
+```powershell
+cd C:\Users\Administrator\llm_rose
+git pull
+python chat_server\chat_server.py --port 8093
+```
+
+سپس در مرورگر: `http://<IP-سرور>:8093` — چت را باز کنید؛ زیر هر پاسخ، سرعت لحظه‌ای (توکن/ثانیه) نمایش داده می‌شود.
+
+### نصب دائمی (شروع خودکار با ویندوز + فایروال + توکن اول)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File chat_server\install_service.ps1 -Action install -Port 8093 -SetOllamaEnv
+```
+
+- `-SetOllamaEnv` متغیرهای بهینه (`OLLAMA_KEEP_ALIVE=-1` و ...) را ثبت می‌کند تا مدل همیشه در RAM بماند و تأخیر ۱۱ ثانیه‌ای پاسخ اول حذف شود.
+- حذف سرویس: `-Action remove` — بررسی وضعیت: `-Action status`
+
+### ساخت و مدیریت توکن API
+
+```powershell
+python chat_server\chat_server.py add-token --name "اپ-موبایل"   # توکن lr_... فقط یک‌بار نمایش داده می‌شود
+python chat_server\chat_server.py list-tokens                     # لیست توکن‌ها + آمار مصرف
+python chat_server\chat_server.py revoke <شناسه>                  # ابطال توکن
+python chat_server\chat_server.py show-admin-key                  # کلید ادمین برای مسیرهای /admin
+```
+
+توکن‌ها فقط به‌صورت هش SHA-256 ذخیره می‌شوند. ساخت توکن از راه دور هم ممکن است: `POST /admin/tokens` با هدر `X-Admin-Key` و بدنه `{"name":"..."}` — و ابطال با `POST /admin/tokens/revoke` و بدنه `{"id":"..."}`.
+
+### استفاده از API (سازگار با OpenAI) در برنامه‌ها
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://130.185.73.157:8093/v1", api_key="lr_xxxxxxxxxxxx")
+r = client.chat.completions.create(
+    model="qwen3:8b",
+    messages=[{"role": "user", "content": "سلام"}],
+)
+print(r.choices[0].message.content)
+```
+
+با curl:
+
+```bash
+curl http://130.185.73.157:8093/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer lr_xxxxxxxxxxxx" \
+  -d '{"model":"qwen3:8b","messages":[{"role":"user","content":"سلام"}]}'
+```
+
+پاسخ استریم هم پشتیبانی می‌شود: `"stream": true` (فرمت SSE استاندارد OpenAI با `data: [DONE]`).
+
+### نکات امنیتی
+
+- اگر سرورتان فایروال بیرونی دارد (پنل شرکت میزبانی/کلود)، پورت 8093 را آنجا هم باز کنید.
+- API همیشه نیازمند توکن است (پیش‌فرض ۳۰ درخواست/دقیقه برای هر توکن). صفحه چت تا زمانی که تست تمام نشده عمومی است (۱۰ درخواست/دقیقه برای هر IP)؛ برای قفل‌کردن آن در `chat_server\data\config.json` مقدار `chat_public` را `false` کنید و سرور را دوباره اجرا کنید.
+- پوشه `chat_server\data\` شامل کلید ادمین و هش توکن‌هاست؛ هرگز آن را کامیت یا به اشتراک نگذارید (در .gitignore است).
+
+## ۹) عیب‌یابی
 
 | مشکل | راه‌حل |
 |---|---|
@@ -255,7 +321,7 @@ python benchmark/bench_app.py --server 192.168.1.10   # تست مدل از یک 
 | خطای illegal instruction هنگام اجرا | CPU مجازی QEMU ممکن است دستورهای AVX2 را پاس نداده باشد؛ تنظیم CPU میزبان را روی host-passthrough بگذارید |
 | پورت 11434 اشغال است | برنامه دیگری روی این پورت را پیدا و متوقف کنید یا `OLLAMA_HOST=0.0.0.0:11435` بگذارید |
 
-## ۹) امنیت
+## ۱۰) امنیت
 
 - **هرگز توکن، کلید API یا رمز را داخل کد و مخزن کامیت نکنید.** توکن GitHub که در مکالمه به اشتراک گذاشته شد، نباید در هیچ فایلی از این مخزن ذخیره شود و پس از اتمام کار باید از GitHub (Settings > Developer settings > Personal access tokens) باطل شود.
 - API مدل را فقط داخل شبکه داخلی ارائه دهید؛ پورت 11434 را مستقیم روی اینترنت باز نکنید.
