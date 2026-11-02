@@ -8,8 +8,12 @@ LLM Rose — سرور چت وب آنلاین + API سازگار با OpenAI هم
   - صفحه چت وب فارسی (RTL) با پاسخ جریانی (استریم) روی پورت دلخواه (پیش‌فرض 8093)
   - تم شب/روز + انتخاب مدل + سایدبار گفتگوها + تاریخچه ماندگار (سرور + مرورگر)
   - پیوست فایل: عکس، Word (docx)، Excel (xlsx)، PowerPoint (pptx)، PDF و متنی (استخراج متن فقط با کتابخانه استاندارد)
+  - تحلیل عکس با مدل بینایی (رتبه‌دهی خودکار به vision_model — پیش‌فرض qwen2.5vl:3b)
+  - جستجوی وب (DuckDuckGo) + خواندن خودکار لینک‌ها و افزودن نتیجه به پاسخ با ذکر منابع
+  - ایجنت‌های تخصصی روان‌شناسی: بالینی، خانواده و زوج، کودک و نوجوان، CBT، تحصیلی/شغلی، همراه بحران
   - اجرای کد HTML/JS داخل صفحه، رندر نمودار فرایند (زیرمجموعه mermaid)، کپی پیام‌ها و کدها
-  - هویت «دستیار هوش مصنوعی کلینیک رز» + پاسخ خودکار از محتوای وب‌سایت کلینیک
+  - بهینه‌سازی سرعت روی CPU: keep_alive دائمی، حذف حالت تفکر، بودجه متن تاریخچه
+  - هویت «دستیار هوش مصنوعی مرکز مشاور رز» + پاسخ خودکار از محتوای وب‌سایت مرکز
     (پایگاه دانش خودکار از صفحه اصلی، باندل JS سایت و APIهای عمومی — ماژول site_kb.py)
   - API سازگار با OpenAI:  POST /v1/chat/completions  و  GET /v1/models
   - سیستم توکن API (lr_...) با ساخت/لیست/ابطال و آمار مصرف هر توکن
@@ -80,12 +84,14 @@ BASE_DIR = Path(__file__).resolve().parent
 # پرامپت پیش‌فرض نسخه‌های قبلی — برای مهاجرت خودکار config.json کاربران قدیمی
 LEGACY_DEFAULT_PROMPT = ("تو یک دستیار فارسی‌زبان، دقیق و مودب هستی. "
                          "پاسخ‌ها کوتاه، مفید و به زبان فارسی باشند.")
+# پرامپت‌های قدیمی که باید خودکار به هویت «مرکز مشاور رز» ارتقا یابند
 
 DEFAULT_SITE_URL = "http://130.185.73.157/"
 DEFAULT_APP_TITLE = "دستیار هوشمند رز"
 
 # هویت دستیار: با کلید system_prompt در config.json قابل تغییر است
-DEFAULT_SYSTEM_PROMPT = (
+# نسخه‌های قدیمی پرامپت — برای مهاجرت خودکار config.json به هویت جدید
+LEGACY_CLINIC_PROMPT = (
     "تو «دستیار هوشمند رز» هستی؛ دستیار هوش مصنوعیِ شرکت مشاوره رز — کلینیک تخصصی مشاوره و روان‌درمانی (رزپسی).\n"
     "هرگاه از تو پرسیدند «تو کیستی؟»، خودت را این‌گونه معرفی کن:\n"
     "«من دستیار هوش مصنوعی کلینیک رز هستم؛ برای راهنمایی درباره خدمات مشاوره و روان‌درمانی، "
@@ -105,10 +111,142 @@ DEFAULT_SYSTEM_PROMPT = (
     "و برچسب یال با |متن|. از subgraph، classDef، استایل و نویسه‌های خاص داخل متن پرهیز کن."
 )
 
-KB_CONTEXT_HEADER = ("\n\n=== اطلاعات رسمی وب‌سایت کلینیک (مبنای پاسخ به این پرسش) ===\n")
+# پرامپت‌های قدیمی که باید خودکار به هویت جدید ارتقا یابند
+LEGACY_PROMPTS = {LEGACY_DEFAULT_PROMPT.strip(), LEGACY_CLINIC_PROMPT.strip()}
+
+DEFAULT_SYSTEM_PROMPT = (
+    "تو «دستیار هوشمند رز» هستی؛ دستیار هوش مصنوعیِ «مرکز مشاور رز» — مرکز تخصصی مشاوره، روان‌شناسی و روان‌درمانی.\n"
+    "هرگاه از تو پرسیدند «تو کیستی؟»، خودت را این‌گونه معرفی کن:\n"
+    "«من دستیار هوش مصنوعی مرکز مشاور رز هستم؛ برای راهنمایی درباره خدمات مشاوره و روان‌درمانی، "
+    "نوبت‌دهی آنلاین، شعبه‌ها و پاسخ به پرسش‌های شما در خدمتم.»\n"
+    "قواعد پاسخ‌گویی:\n"
+    "۱) همیشه فارسی، کوتاه، گرم و حرفه‌ای بنویس.\n"
+    "۲) درباره خدمات، قیمت‌ها، شعبه‌ها و نوبت‌دهی فقط از «اطلاعات رسمی وب‌سایت» که در پیام سامانه ارسال می‌شود "
+    "استفاده کن؛ عدد، قیمت یا آدرس از خودت نساز.\n"
+    "۳) اگر پاسخ در اطلاعات رسمی نبود، صادقانه بگو و کاربر را به فرم درخواست مشاوره در سایت یا تماس با پذیرش هدایت کن.\n"
+    "۴) برای رزرو نوبت، کاربر را به بخش نوبت‌دهی آنلاین سایت هدایت کن.\n"
+    "۵) پرسش‌های عمومی روان‌شناسی را ساده و با احتیاط پاسخ بده؛ تشخیص و تجویز درمان مخصوص متخصص است. "
+    "در موارد بحرانی (مانند افکار خودآسیبی) فوراً به اورژانس اجتماعی ۱۲۳ یا پذیرش مرکز ارجاع بده.\n"
+    "۶) قالب پاسخ: مارک‌داون ساده (تیتر با ##، لیست با -، پررنگ با **…**)؛ کدها همیشه داخل بلوک سه‌بک‌تیک با نام زبان؛ "
+    "اگر کاربر کد HTML خواست، یک سند کامل و قابل‌اجرا با <!DOCTYPE html> بده.\n"
+    "۷) اگر کاربر «نمودار، فرایند، فلوچارت یا مدل» خواست، یک بلوک ```mermaid بساز با فقط این قواعد: "
+    "خط اول flowchart TD (یا LR)، گره‌ها به‌شکل A[متن] یا A(متن) یا A{متن}، یال‌ها فقط --> یا -.-> یا --- "
+    "و برچسب یال با |متن|. از subgraph، classDef، استایل و نویسه‌های خاص داخل متن پرهیز کن."
+)
+
+KB_CONTEXT_HEADER = ("\n\n=== اطلاعات رسمی وب‌سایت مرکز مشاور رز (مبنای پاسخ به این پرسش) ===\n")
 KB_CONTEXT_FOOTER = ("\n=== پایان اطلاعات وب‌سایت ===\n"
                      "برای خدمات، قیمت، آدرس شعبه‌ها و نوبت‌دهی فقط بر اساس همین اطلاعات پاسخ بده؛ "
                      "اگر پاسخ کامل در این اطلاعات نبود، کاربر را به فرم درخواست مشاوره یا پذیرش هدایت کن.")
+
+WEB_CONTEXT_HEADER = "\n\n=== نتایج جستجوی وب ({date}) ===\n"
+WEB_CONTEXT_FOOTER = ("\n=== پایان نتایج جستجو ===\n"
+                      "در پاسخ به این پرسش از نتایج بالا استفاده کن و منبع‌ها را با شماره [۱] [۲] ذکر کن؛ "
+                      "اگر نتیجه‌ها کافی نبود صادقانه بگو.")
+
+# الگوی نام مدل‌های بینایی‌دار Ollama (برای مسیریابی خودکار عکس‌ها)
+VISION_MODEL_PAT = re.compile(
+    r"^(gemma3|gemma3:\S+|qwen2\.5vl|qwen2\.5-vl|llava|llama3\.2-vision|minicpm-v|"
+    r"minicpm\S*|moondream|glm4v|granite3\.2-vision|internvl\S*)", re.I)
+
+UA_BROWSER = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+# کلیدواژه‌هایی که یعنی کاربر صریحاً جستجوی وب می‌خواهد (حتی اگر دکمه جستجو خاموش باشد)
+SEARCH_INTENT_RE = re.compile(
+    r"(جستجو\s*(کن|در\s*اینترنت|در\s*وب|در\s*گوگل)?|سرچ\s*(کن)?|گوگل\s*کن|"
+    r"از\s*اینترنت|اخبار|تازه\u200cترین|آخرین\s*اخبار|قیمت\s*(امروز|روز)|search\b|"
+    r"\bgoogle\b|\bnews\b|\blatest\b)", re.I)
+
+URL_RE = re.compile(r"https?://[^\s<>()\[\]]+")
+
+
+# =====================================================================
+# ایجنت‌های تخصصی مرکز مشاور رز (پرامپت هر ایجنت به پرامپت پایه افزوده می‌شود)
+# =====================================================================
+AGENTS = [
+    {"id": "general", "emoji": "🌿", "name": "دستیار عمومی مرکز رز",
+     "prompt": ""},
+    {"id": "clinical", "emoji": "🧠", "name": "روان‌شناس بالینی",
+     "prompt": ("در این گفتگو نقش «روان‌شناس بالینی» مرکز مشاور رز را داری.\n"
+                "- با پرسش‌های کوتاه و همدلانه مشکل را روشن کن (مدت، شدت، زمینه، تاثیر بر زندگی).\n"
+                "- درباره اضطراب، افسردگی، وسواس، استرس پس از سانحه و خواب روان‌آموزی ساده بده.\n"
+                "- تکنیک‌های خودیاری امن پیشنهاد بده (تن‌آرامی، بهداشت خواب، فعال‌سازی رفتاری).\n"
+                "- تشخیص قطعی نده و دارو تجویز نکن؛ برای ارزیابی حضوری به پذیرش مرکز ارجاع بده.")},
+    {"id": "family", "emoji": "💞", "name": "مشاور خانواده و زوج",
+     "prompt": ("در این گفتگو نقش «مشاور خانواده و زوج‌درمانگر» مرکز مشاور رز را داری.\n"
+                "- نگاه سیستمی داشته باش؛ طرف هیچ‌کس را نگیر و از قضاوت پرهیز کن.\n"
+                "- روی الگوهای ارتباطی، گوش‌دادن فعال، توافق و مرزهای سالم تمرکز کن.\n"
+                "- تمرین‌های عملی برای زوج‌ها/خانواده بده (قرار گفتگوی هفتگی بدون گوشی، تمرین گوش‌دادن فعال، «من احساس می‌کنم…» به‌جای سرزنش).\n"
+                "- در خشونت خانگی یا خیانت، امنیت افراد را اول بگذار و به مشاوره حضوری ارجاع بده.")},
+    {"id": "child", "emoji": "🧒", "name": "روان‌شناس کودک و نوجوان",
+     "prompt": ("در این گفتگو نقش «روان‌شناس کودک و نوجوان» مرکز مشاور رز را داری؛ مخاطب تو معمولاً والدین یا مربیان‌اند.\n"
+                "- راهنمایی‌ها را متناسب سن کودک/نوجوان بده و اصول فرزندپروری مثبت را رعایت کن.\n"
+                "- برای ترس، لجبازی، کم‌توجهی، اضطراب مدرسه و قشقرق، گام‌های عملی ساده بده.\n"
+                "- تأکید کن از تنبیه بدنی و برچسب‌زنی پرهیز شود.\n"
+                "- اگر نشانه‌های تأخیر رشد، پرتحرکی شدید یا خودآسیبی دیده شد، ارزیابی حضوری توصیه کن.")},
+    {"id": "cbt", "emoji": "🛠️", "name": "درمانگر CBT",
+     "prompt": ("در این گفتگو نقش «درمانگر شناختی-رفتاری (CBT)» را داری.\n"
+                "- افکار خودآیند را از موقعیت، هیجان و رفتار جدا کن و با سؤال‌های SOCRATES بازبینی کن.\n"
+                "- تمرین‌های گام‌به‌گام بده: ثبت افکار، جدول هزینه-فایده، آزمایش رفتاری، مواجهه تدریجی.\n"
+                "- هر پاسخ حداکثر یک تمرین مشخص + توضیح کوتاه «چرا این تمرین» باشد.\n"
+                "- هدف توانمندسازی است؛ جایگزین جلسات درمانی رسمی نیستی.")},
+    {"id": "career", "emoji": "🎯", "name": "مشاور تحصیلی و شغلی",
+     "prompt": ("در این گفتگو نقش «مشاور تحصیلی و شغلی» مرکز مشاور رز را داری.\n"
+                "- برای انتخاب رشته، کنکور، مهاجرت تحصیلی، تغییر شغل و مصاحبه راهنمای مرحله‌به‌مرحله بده.\n"
+                "- تصمیم‌گیری را با جدول معیارها و اولویت‌ها ساختارمند کن؛ به‌جای جواب قطعی، گزینه‌ها را روشن کن.\n"
+                "- برنامه‌ریزی مطالعه واقع‌بینانه با تکنیک پومودورو و مرور فاصله‌دار پیشنهاد بده.")},
+    {"id": "crisis", "emoji": "🆘", "name": "همراه بحران (حمایت فوری)",
+     "prompt": ("در این گفتگو نقش «همراه بحران» مرکز مشاور رز را داری؛ کاربر ممکن است در پریشانی شدید باشد.\n"
+                "- آرام، کوتاه و بسیار گرم بنویس؛ اول فقط شنونده باش و احساس او را بازگو کن.\n"
+                "- تمرین‌های فوری تن‌آرامی و پایه‌گذاری (۵-۴-۳-۲-۱) آموزش بده.\n"
+                "- هر نشانه‌ای از خطر جانی، خودآسیبی یا خودکشی: فوراً و قاطعانه بگو با اورژانس اجتماعی ۱۲۳، "
+                "اورژانس ۱۱۰ یا اورژانس پزشکی ۱۱۵ تماس بگیرد و تنهایی نماند.\n"
+                "- هرگز قول رازداری مطلق نده و تنهایی با بحران کنار نیا؛ کمک حرفه‌ای فوری لازم است.")},
+]
+AGENT_MAP = {a["id"]: a for a in AGENTS}
+SAFE_AGENT_IDS = list(AGENT_MAP.keys())
+
+
+# =====================================================================
+# تاریخ شمسی + ابزارهای جستجوی وب (فقط کتابخانه استاندارد)
+# =====================================================================
+def to_jalali(gy, gm, gd):
+    """تبدیل گرگوری به هجری شمسی (الگوریتم استاندارد)"""
+    g_d_m = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    gy2 = gy + 1 if gm > 2 else gy
+    days = 355666 + (365 * gy) + ((gy2 + 3) // 4) - ((gy2 + 99) // 100) \
+        + ((gy2 + 399) // 400) + gd + g_d_m[gm - 1]
+    jy = -1595 + (33 * (days // 12053))
+    days %= 12053
+    jy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365
+        days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + (days // 31)
+        jd = 1 + (days % 31)
+    else:
+        jm = 7 + ((days - 186) // 30)
+        jd = 1 + ((days - 186) % 30)
+    return jy, jm, jd
+
+
+FA_WEEKDAYS = {0: "دوشنبه", 1: "سه‌شنبه", 2: "چهارشنبه", 3: "پنجشنبه",
+               4: "جمعه", 5: "شنبه", 6: "یکشنبه"}
+
+
+def today_fa(now=None):
+    """رشته تاریخ امروز برای پرامپت: شمسی + میلادی + روز هفته"""
+    now = now or datetime.now()
+    try:
+        jy, jm, jd = to_jalali(now.year, now.month, now.day)
+        jpart = f"{jy}/{jm:02d}/{jd:02d}"
+    except Exception:
+        jpart = ""
+    wd = FA_WEEKDAYS.get(now.weekday(), "")
+    return f"{wd} {jpart} ({now.year:04d}-{now.month:02d}-{now.day:02d} میلادی)"
 
 # =====================================================================
 # تنظیمات (ذخیره در data/config.json — کلید ادمین در اولین اجرا ساخته می‌شود)
@@ -139,8 +277,8 @@ def load_settings(args):
     if getattr(args, "private", False):
         s.chat_public = False
     sp = cfg.get("system_prompt")
-    if sp and sp.strip() == LEGACY_DEFAULT_PROMPT.strip():
-        sp = None  # پرامپت پیش‌فرض قدیمی → مهاجرت به پرامپت هویت جدید
+    if sp and sp.strip() in LEGACY_PROMPTS:
+        sp = None  # پرامپت قدیمی (عمومی یا «کلینیک رز») → مهاجرت خودکار به هویت «مرکز مشاور رز»
     s.system_prompt = sp or DEFAULT_SYSTEM_PROMPT
 
     # وب‌سایت و پایگاه دانش (RAG سبک)
@@ -153,6 +291,12 @@ def load_settings(args):
     s.kb_context_chars = int(cfg.get("kb_context_chars", 1800))
     s.admin_key = cfg.get("admin_key") or secrets.token_hex(16)
 
+    # ایجنت‌ها، جستجوی وب و مدل بینایی
+    s.vision_model = (getattr(args, "vision_model", None) or cfg.get("vision_model", "qwen2.5vl:3b")).strip()
+    s.web_search = bool(cfg.get("web_search", True))
+    s.search_max_pages = max(0, int(cfg.get("search_max_pages", 2)))
+    s.search_timeout = float(cfg.get("search_timeout", 9))
+
     cfg.update({
         "port": s.port, "ollama": s.ollama, "model": s.model, "ctx": s.ctx,
         "max_output_tokens": s.max_output_tokens,
@@ -162,11 +306,19 @@ def load_settings(args):
         "site_url": s.site_url, "app_title": s.app_title,
         "site_kb": s.site_kb_enabled, "site_kb_refresh_hours": s.site_kb_refresh_hours,
         "kb_context_chars": s.kb_context_chars,
+        "vision_model": s.vision_model, "web_search": s.web_search,
+        "search_max_pages": s.search_max_pages, "search_timeout": s.search_timeout,
         "admin_key": s.admin_key,
     })
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-    # صفحه HTML با عنوان و آدرس سایت پر می‌شود (یک‌بار در شروع)
-    s.html_page = HTML_PAGE.replace("__APP_TITLE__", s.app_title).replace("__SITE_URL__", s.site_url)
+    # صفحه HTML با عنوان و آدرس سایت و فهرست ایجنت‌ها پر می‌شود (یک‌بار در شروع)
+    agents_json = json.dumps(
+        [{"id": a["id"], "emoji": a["emoji"], "name": a["name"]} for a in AGENTS],
+        ensure_ascii=False).replace("</", "<\\/")
+    s.html_page = (HTML_PAGE
+                   .replace("__APP_TITLE__", s.app_title)
+                   .replace("__SITE_URL__", s.site_url)
+                   .replace("__AGENTS_JSON__", agents_json))
     return s
 
 
@@ -405,7 +557,8 @@ class HistoryStore:
     def __init__(self, data_dir):
         self.dir = Path(data_dir) / "history"
         self.dir.mkdir(parents=True, exist_ok=True)
-        self.lock = threading.Lock()
+        # RLock تا فراخوانی تودرتو (delete → save) دچار بن‌بست نشود
+        self.lock = threading.RLock()
 
     @staticmethod
     def safe_uid(uid):
@@ -457,6 +610,7 @@ class HistoryStore:
                     pass
                 return
             chats = [c for c in self.load(uid) if c.get("id") != chat_id]
+            # توجه: save هم همان قفل (RLock) را می‌گیرد؛ چون RLock بازگشتی است بن‌بست رخ نمی‌دهد
             self.save(uid, chats)
 
 
@@ -485,6 +639,95 @@ MODEL_RE = re.compile(r"[A-Za-z0-9._:\-/]{1,64}")
 
 
 # =====================================================================
+# جستجوی وب (DuckDuckGo Lite/HTML) + خواندن صفحه — فقط کتابخانه استاندارد
+# =====================================================================
+def _strip_html(raw_html):
+    txt = re.sub(r"(?is)<(script|style|noscript|svg|header|footer|nav)[^>]*>.*?</\1>", " ", raw_html)
+    txt = re.sub(r"(?is)<br\s*/?>|</p>|</div>|</li>|</h[1-6]>|</tr>", "\n", txt)
+    txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+    txt = html_lib.unescape(txt)
+    txt = re.sub(r"[ \t\r\f\v]+", " ", txt)
+    txt = re.sub(r"\n\s*\n+", "\n", txt)
+    return txt.strip()
+
+
+def web_search(query, max_results=6, timeout=9):
+    """جستجو در DuckDuckGo؛ خروجی: [{"title","url","snippet"}] — در خطا لیست خالی"""
+    from urllib.parse import quote, unquote
+    results = []
+    q = quote(query)
+    endpoints = ["https://lite.duckduckgo.com/lite/?q=" + q,
+                 "https://html.duckduckgo.com/html/?q=" + q]
+    for base in endpoints:
+        try:
+            req = urlreq.Request(base, headers={
+                "User-Agent": UA_BROWSER, "Accept": "text/html",
+                "Accept-Language": "fa,en;q=0.8"})
+            page = urlreq.urlopen(req, timeout=timeout).read().decode("utf-8", errors="ignore")
+            links, snippets = [], []
+            # لینک‌های نتیجه (هر دو قالب lite و html)
+            for m in re.finditer(
+                    r"<a[^>]+?href=[\"']((?:https?:)?//[^\"']+)[\"'][^>]*?"
+                    r"class=[\"'](?:result-link|result__a)[\"'][^>]*?>(.*?)</a>", page, re.S):
+                href, title = m.group(1), re.sub(r"(?s)<[^>]+>", "", m.group(2)).strip()
+                if "uddg=" in href:
+                    mm = re.search(r"uddg=([^&]+)", href)
+                    if mm:
+                        href = unquote(mm.group(1))
+                if href.startswith("//"):
+                    href = "https:" + href
+                if not href.startswith("http") or "duckduckgo.com" in href:
+                    continue
+                if title:
+                    links.append({"title": title[:140], "url": href[:300]})
+            for m in re.finditer(
+                    r"class=[\"'](?:result-snippet|result__snippet)[\"'][^>]*>(.*?)</(?:td|a)>",
+                    page, re.S):
+                snippets.append(_strip_html(m.group(1))[:320])
+            for i, l in enumerate(links):
+                l["snippet"] = snippets[i] if i < len(snippets) else ""
+            # حذف تکراری
+            seen = set()
+            for l in links:
+                k = l["url"].split("#")[0]
+                if k in seen:
+                    continue
+                seen.add(k)
+                results.append(l)
+            if results:
+                break
+        except Exception:
+            continue
+    return results[:max_results]
+
+
+def fetch_page_text(url, max_chars=1400, timeout=9):
+    """متن سادهٔ یک صفحه وب (برای افزودن به زمینه) — در خطا رشته خالی"""
+    try:
+        req = urlreq.Request(url, headers={
+            "User-Agent": UA_BROWSER, "Accept": "text/html,text/plain",
+            "Accept-Language": "fa,en;q=0.8"})
+        with urlreq.urlopen(req, timeout=timeout) as r:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if ctype and not any(t in ctype for t in ("text/html", "text/plain", "application/xhtml")):
+                return ""
+            data = r.read(400_000)
+        enc = "utf-8"
+        m = re.search(r'charset=["\']?([\w-]+)', ctype or "", re.I)
+        if m:
+            enc = m.group(1)
+        raw = data.decode(enc, errors="ignore")
+        title = ""
+        mt = re.search(r"(?is)<title[^>]*>(.*?)</title>", raw)
+        if mt:
+            title = html_lib.unescape(mt.group(1)).strip()[:120]
+        body = _strip_html(raw)[:max_chars]
+        return (title + "\n" + body).strip() if title else body
+    except Exception:
+        return ""
+
+
+# =====================================================================
 # ارتباط با Ollama
 # =====================================================================
 def ollama_chat_stream(settings, messages, num_predict, model=None):
@@ -493,6 +736,7 @@ def ollama_chat_stream(settings, messages, num_predict, model=None):
         "messages": messages,
         "stream": True,
         "think": False,  # پاسخ سریع روی CPU؛ برای سرعت حالت تفکر خاموش است
+        "keep_alive": -1,  # مدل همیشه در RAM بماند؛ حذف تأخیر ~۱۰ ثانیه‌ایِ بارگذاری مجدد
         "options": {
             "num_ctx": settings.ctx,
             "temperature": 0.7,
@@ -530,7 +774,7 @@ HTML_PAGE = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__APP_TITLE__ | کلینیک رز</title>
+<title>__APP_TITLE__ | مرکز مشاور رز</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='16' fill='%23e91e63'/%3E%3Ctext x='16' y='22' font-size='18' font-weight='bold' text-anchor='middle' fill='white' font-family='Arial'%3ER%3C/text%3E%3C/svg%3E">
 <style>
 :root{--bg:#0f1117;--panel:#171a23;--panel2:#1e2230;--line:#2a2f40;--text:#e8eaf0;
@@ -573,8 +817,9 @@ border-radius:20px;padding:4px 10px;color:var(--dim)}
 .spacer{flex:1}
 #burger{background:var(--panel2);border:1px solid var(--line);color:var(--text);width:34px;
 height:32px;border-radius:10px;font-size:16px;padding:0;display:none}
-#modelsel{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+#modelsel,#agentsel{background:var(--panel2);border:1px solid var(--line);color:var(--text);
 border-radius:20px;padding:4px 10px;font-family:inherit;font-size:12px;outline:none;max-width:150px}
+#agentsel{max-width:170px}
 #themebtn{background:var(--panel2);border:1px solid var(--line);color:var(--text);
 width:36px;height:32px;padding:0;font-size:15px;line-height:1;border-radius:10px}
 #themebtn:hover{border-color:var(--accent)}
@@ -663,6 +908,15 @@ padding:8px 12px;overflow-x:auto;direction:ltr;text-align:left;font-size:12px}
 #toast{position:fixed;bottom:86px;right:50%;transform:translateX(50%);background:var(--accent);
 color:#fff;border-radius:20px;padding:6px 18px;font-size:13px;opacity:0;pointer-events:none;
 transition:opacity .3s;z-index:50}
+/* ---------- منابع وب و اعلان‌ها ---------- */
+.srcbox{margin-top:8px;border-top:1px dashed var(--line);padding-top:6px;font-size:12.5px}
+.srcbox .st{color:var(--dim);font-weight:700;margin-bottom:2px}
+.srcbox a{display:block;color:var(--accent2);text-decoration:none;white-space:nowrap;
+overflow:hidden;text-overflow:ellipsis;direction:ltr;text-align:left;line-height:2}
+.srcbox a:hover{text-decoration:underline}
+.notice{font-size:12.5px;color:#b8860b;background:rgba(255,193,7,.12);border:1px solid rgba(255,193,7,.4);
+border-radius:10px;padding:6px 12px;margin-bottom:8px;line-height:1.9}
+html[data-theme="light"] .notice{color:#7a5b00}
 @media (max-width:820px){
   #side{position:fixed;top:0;bottom:0;right:0;z-index:40;margin-right:-262px;box-shadow:-4px 0 18px rgba(0,0,0,.3)}
   #side.show{margin-right:0}
@@ -687,8 +941,10 @@ transition:opacity .3s;z-index:50}
       <h1>__APP_TITLE__</h1>
       <span class="badge"><span class="dot" id="dot"></span><span id="modelname">…</span></span>
       <select id="modelsel" title="انتخاب مدل (سرعت/کیفیت)"></select>
+      <select id="agentsel" title="انتخاب مشاور / ایجنت تخصصی"></select>
+      <span class="badge" id="webbtn" style="cursor:pointer;user-select:none" title="جستجوی وب قبل از پاسخ (DuckDuckGo)">🌐 جستجوی وب: خاموش</span>
       <span class="badge" id="speedbadge">سرعت: —</span>
-      <a class="badge" href="__SITE_URL__" target="_blank" rel="noopener" title="وب‌سایت کلینیک رز">وب‌سایت کلینیک ↗</a>
+      <a class="badge" href="__SITE_URL__" target="_blank" rel="noopener" title="وب‌سایت مرکز مشاور رز">وب‌سایت مرکز ↗</a>
       <span class="spacer"></span>
       <span class="badge" id="clearbtn" style="cursor:pointer">🧹 پاک‌کردن گفتگو</span>
       <button id="themebtn" title="تغییر تم شب/روز">🌙</button>
@@ -699,15 +955,18 @@ transition:opacity .3s;z-index:50}
       <button id="keysave">ذخیره</button>
     </div>
 
-    <div id="chat"><div class="msg bot" id="welcome">سلام 👋 من دستیار هوش مصنوعی کلینیک رز هستم؛ درباره خدمات، هزینه‌ها، شعبه‌ها و نوبت‌دهی آنلاین می‌توانم کمکتان کنم.
-می‌توانید عکس، فایل Word، Excel یا PDF هم پیوست کنید، از من کد HTML بخواهید تا همین‌جا اجرا کنم، یا برای فرایندها نمودار بکشم. بپرسید!</div></div>
+    <div id="chat"><div class="msg bot" id="welcome">سلام 👋 من دستیار هوش مصنوعی **مرکز مشاور رز** هستم؛ درباره خدمات مشاوره و روان‌درمانی، هزینه‌ها، شعبه‌ها و نوبت‌دهی آنلاین کمکتان می‌کنم.
+از منوی «مشاور» بالا می‌توانید ایجنت تخصصی انتخاب کنید: روان‌شناس بالینی 🧠، مشاور خانواده 💞، کودک و نوجوان 🧒، CBT 🛠️ و همراه بحران 🆘.
+می‌توانید عکس، فایل Word، Excel یا PDF پیوست کنید، دکمه «جستجوی وب 🌐» را روشن کنید تا از اینترنت پاسخ بدهم، کد HTML بخواهید تا اجرا کنم، یا برای فرایندها نمودار بکشم. بپرسید!</div></div>
 
     <details id="guide">
       <summary>راهنمای امکانات و API (برای برنامه‌های شما)</summary>
       <div>
-        <b>امکانات صفحه چت:</b> پیوست عکس/Word/Excel/PDF 📎 — اجرای کد HTML و JavaScript — نمایش نمودار فرایند (mermaid) —
-        کپی پیام‌ها و کدها — تاریخچه گفتگوها — تم شب/روز — انتخاب مدل.<br>
+        <b>امکانات صفحه چت:</b> ایجنت‌های تخصصی (روان‌شناس بالینی، خانواده، کودک، CBT، تحصیلی/شغلی، همراه بحران) —
+        جستجوی وب 🌐 با ذکر منابع — تحلیل عکس با مدل بینایی — پیوست Word/Excel/PDF — اجرای کد HTML و JavaScript —
+        نمودار فرایند (mermaid) — کپی پیام‌ها — تاریخچه — تم شب/روز — انتخاب مدل.<br>
         برای نمودار کافی است بخواهید: «فرایند نوبت‌دهی را به‌صورت فلوچارت بکش».<br><br>
+        <b>سرعت:</b> مدل «qwen3:4b» حدود ۲ برابر سریع‌تر است (از انتخاب‌مدل بالا)؛ مدل‌های ۸b روی CPU حدود ۴ تا ۹ توکن/ثانیه می‌دهند.
         این سرور یک API سازگار با OpenAI روی همان آدرس ارائه می‌دهد. ابتدا روی سرور با اجرای
         <b>python chat_server.py add-token --name test</b> یک توکن بسازید:
         <pre>curl http://<span class="host"></span>/v1/chat/completions \
@@ -720,9 +979,9 @@ r = client.chat.completions.create(
     model="<span class="mname"></span>",
     messages=[{"role":"user","content":"سلام"}])
 print(r.choices[0].message.content)</pre>
-        <b>تحلیل عکس:</b> مدل پیش‌فرض متن‌محور است؛ برای دیدن عکس‌ها روی سرور یک مدل بینایی بکشید:
-        <pre>ollama pull gemma3:4b   <span style="opacity:.6"># یا qwen2.5vl:7b</span></pre>
-        سپس از انتخاب‌مدل بالای صفحه همان را انتخاب کنید.
+        <b>تحلیل عکس (ایجنت بینایی):</b> اگر عکس پیوست کنید، پیام به‌طور خودکار به مدل بینایی می‌رود. روی سرور مدل بینایی را نصب کنید:
+        <pre>ollama pull qwen2.5vl:3b   <span style="opacity:.6"># یا gemma3:4b برای کیفیت بهتر</span></pre>
+        (نام مدل بینایی در config.json با کلید vision_model تنظیم می‌شود؛ مدل‌های بینایی با علامت 👁 شناخته می‌شوند.)
       </div>
     </details>
 
@@ -790,12 +1049,14 @@ fetch("/health").then(r=>r.json()).then(h=>{
 document.querySelectorAll(".host").forEach(e=>e.textContent=location.host);
 
 let chosenModel = localStorage.getItem("lr_model") || "";
+const VISION_RE = /^(gemma3|qwen2\.5vl|qwen2\.5-vl|llava|llama3\.2-vision|minicpm|moondream|glm4v|granite3\.2-vision|internvl)/i;
 async function loadModels(){
   try{
     const r=await fetch("/api/models");const d=await r.json();
     const sel=$("modelsel");sel.innerHTML="";
     (d.models||[]).forEach(m=>{
-      const o=document.createElement("option");o.value=m;o.textContent=m;
+      const o=document.createElement("option");o.value=m;
+      o.textContent=m+(VISION_RE.test(m)?"  👁":"");
       if(m===(chosenModel||d.current))o.selected=true;sel.appendChild(o);
     });
     chosenModel=sel.value;
@@ -803,6 +1064,33 @@ async function loadModels(){
 }
 $("modelsel").onchange=e=>{chosenModel=e.target.value;try{localStorage.setItem("lr_model",chosenModel);}catch(x){}};
 loadModels();
+
+/* ---------- ایجنت‌های تخصصی + کلید جستجوی وب ---------- */
+const AGENTS = __AGENTS_JSON__;
+let chosenAgent = localStorage.getItem("lr_agent") || "general";
+if(!AGENTS.some(a=>a.id===chosenAgent))chosenAgent="general";
+(function initAgents(){
+  const asel=$("agentsel");asel.innerHTML="";
+  AGENTS.forEach(a=>{
+    const o=document.createElement("option");o.value=a.id;o.textContent=a.emoji+" "+a.name;
+    if(a.id===chosenAgent)o.selected=true;asel.appendChild(o);
+  });
+  asel.onchange=e=>{chosenAgent=e.target.value;
+    try{localStorage.setItem("lr_agent",chosenAgent);}catch(x){}
+    const a=AGENTS.find(x=>x.id===chosenAgent);toast((a?a.emoji:"")+" "+(a?a.name:"مشاور تغییر کرد"));
+  };
+})();
+let webOn = false;
+try{ webOn = localStorage.getItem("lr_web")==="1"; }catch(e){}
+const webBtn=$("webbtn");
+function paintWeb(){
+  webBtn.textContent="🌐 جستجوی وب: "+(webOn?"روشن":"خاموش");
+  webBtn.style.color=webOn?"var(--accent2)":"";
+  webBtn.style.borderColor=webOn?"var(--accent)":"";
+}
+webBtn.onclick=()=>{webOn=!webOn;try{localStorage.setItem("lr_web",webOn?"1":"0");}catch(e){}paintWeb();
+  toast(webOn?"جستجوی وب روشن شد — پاسخ‌ها از اینترنت کامل‌تر می‌شوند (کمی کندتر)":"جستجوی وب خاموش شد");};
+paintWeb();
 
 /* ---------- تاریخچه گفتگوها (سرور + مرورگر) ---------- */
 let LRUID="";
@@ -881,6 +1169,18 @@ $("clearbtn").onclick=()=>{
   if(c){c.msgs=[];scheduleSave();}
   messages=[];chat.innerHTML="";chat.appendChild(welcomeEl);
 };
+
+/* ---------- رندر منابع وب ---------- */
+function renderSources(bubble,sources){
+  if(bubble.querySelector(".srcbox"))return;
+  const d=document.createElement("div");d.className="srcbox";
+  d.innerHTML='<div class="st">🔗 منابع وب:</div>';
+  (sources||[]).slice(0,8).forEach((s,i)=>{
+    const a=document.createElement("a");a.href=s.url||"#";a.target="_blank";a.rel="noopener";
+    a.textContent="["+(i+1)+"] "+(s.title||s.url||"");a.title=s.url||"";d.appendChild(a);
+  });
+  bubble.appendChild(d);
+}
 
 /* ---------- حباب‌های پیام ---------- */
 function addBubble(cls,text){
@@ -1284,7 +1584,8 @@ async function send(){
     const res=await fetch("/api/chat/stream",{
       method:"POST",
       headers:Object.assign({"Content-Type":"application/json"},authHeaders()),
-      body:JSON.stringify({messages:messages,model:chosenModel||undefined}),
+      body:JSON.stringify({messages:messages,model:chosenModel||undefined,
+        agent:chosenAgent,web_search:webOn}),
       signal:ctl.signal
     });
     if(res.status===401){showKeybar(true);bot.textContent="این چت خصوصی است؛ کلید API را در نوار بالا وارد کنید.";bot.classList.add("errm");throw new Error("auth");}
@@ -1302,11 +1603,21 @@ async function send(){
         const line=block.split("\n").find(l=>l.startsWith("data: "));
         if(!line)continue;
         let obj;try{obj=JSON.parse(line.slice(6));}catch(e){continue;}
+        if(obj.notice&&!obj.content){
+          const n=document.createElement("div");n.className="notice";n.textContent="⚠️ "+obj.notice;
+          bot.insertBefore(n,bot.firstChild);scrollDown();
+        }
+        if(obj.sources&&obj.sources.length){renderSources(bot,obj.sources);scrollDown();}
         if(obj.error){bot.textContent=(full?full+"\n":"")+"خطا: "+obj.error;bot.classList.add("errm");}
         if(obj.content){
-          if(ttft===null){ttft=performance.now()-t0;bot.textContent="";}
+          if(ttft===null){
+            ttft=performance.now()-t0;
+            const n=bot.querySelector(".notice");
+            bot.textContent="";
+            if(n)bot.insertBefore(n,bot.firstChild);
+          }
           full+=obj.content;
-          bot.textContent=full;
+          bot.appendChild(document.createTextNode(obj.content));
           scrollDown();
         }
         if(obj.done&&obj.stats){
@@ -1322,9 +1633,12 @@ async function send(){
     if(full){
       messages.push({role:"assistant",content:full});
       if(cur){cur.msgs=messages.map(m=>{const o={role:m.role,content:m.content};if(m.att)o.att=m.att;return o;});}
-      // رندر نهایی مارک‌داون + دکمه‌ها
+      // رندر نهایی مارک‌داون + دکمه‌ها (حفظ اعلان و منابع)
+      const noticeEl=bot.querySelector(".notice"),srcEl=bot.querySelector(".srcbox");
       bot.classList.remove("errm");
       bot.innerHTML="";bot.appendChild(renderMD(full));
+      if(noticeEl)bot.insertBefore(noticeEl,bot.firstChild);
+      if(srcEl)bot.appendChild(srcEl);
       addMsgFoot(bot,full);
       scheduleSave();
     }
@@ -1333,7 +1647,7 @@ async function send(){
       bot.textContent="خطا در ارتباط با سرور. سرویس مدل را بررسی کنید.";
       bot.classList.add("errm");
     }
-    if(full){try{bot.innerHTML="";bot.appendChild(renderMD(full));addMsgFoot(bot,full);}catch(e){bot.textContent=full;}if(cur){cur.msgs=messages.map(m=>{const o={role:m.role,content:m.content};if(m.att)o.att=m.att;return o;});scheduleSave();}}
+    if(full){try{const noticeEl=bot.querySelector(".notice"),srcEl=bot.querySelector(".srcbox");bot.innerHTML="";bot.appendChild(renderMD(full));if(noticeEl)bot.insertBefore(noticeEl,bot.firstChild);if(srcEl)bot.appendChild(srcEl);addMsgFoot(bot,full);}catch(e){bot.textContent=full;}if(cur){cur.msgs=messages.map(m=>{const o={role:m.role,content:m.content};if(m.att)o.att=m.att;return o;});scheduleSave();}}
   }
   setBusy(false);
   if(pendingBusy)sendBtn.disabled=true;
@@ -1423,7 +1737,7 @@ def build_handler(settings, store, limiter, boot_ts, hist):
             self.wfile.write(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n").encode("utf-8"))
             self.wfile.flush()
 
-        def _clean_messages(self, msgs, max_turns=40, max_chars=8000):
+        def _clean_messages(self, msgs, max_turns=20, max_chars=4000):
             clean = []
             for m in (msgs or [])[-max_turns:]:
                 if not isinstance(m, dict):
@@ -1444,13 +1758,20 @@ def build_handler(settings, store, limiter, boot_ts, hist):
                         atts = m.get("attachments")
                         if isinstance(atts, list) and atts:
                             folded = []
-                            for a in atts[:6]:
+                            for a in atts[:4]:
                                 if isinstance(a, dict) and a.get("name"):
                                     folded.append("«فایل پیوست: " + str(a["name"])[:80] + "»\n"
-                                                  + str(a.get("text") or "")[:6000])
+                                                  + str(a.get("text") or "")[:4000])
                             if folded:
                                 out["content"] = out["content"] + "\n\n" + "\n\n".join(folded)
                     clean.append(out)
+            # بودجه کل متن تاریخچه — پرامپت کوتاه‌تر = پردازش سریع‌تر روی CPU
+            total_budget = 16000
+            while len(clean) > 2 and sum(len(m["content"]) for m in clean) > total_budget:
+                idx = next((i for i, mm in enumerate(clean) if mm["role"] != "system"), None)
+                if idx is None:
+                    break
+                clean.pop(idx)
             return clean
 
         @staticmethod
@@ -1477,17 +1798,86 @@ def build_handler(settings, store, limiter, boot_ts, hist):
                 return ""
 
         def _effective_system(self, msgs):
-            """پرامپت هویت + (در صورت مرتبط بودن پرسش) اطلاعات رسمی سایت"""
-            base = settings.system_prompt
+            """پرامپت هویت + تاریخ امروز + (در صورت مرتبط بودن پرسش) اطلاعات رسمی سایت"""
+            sys_text, _sources = self._build_system(msgs, agent_id=None, force_search=False)
+            return sys_text
+
+        def _build_system(self, msgs, agent_id=None, force_search=False):
+            """پرامپت کامل سامانه: هویت + تاریخ + ایجنت + دانش سایت + جستجوی وب
+            خروجی: (متن system، فهرست منابع برای نمایش در UI)"""
             last_user = ""
             for m in reversed(msgs):
                 if m.get("role") == "user":
                     last_user = m.get("content") or ""
                     break
+            base = settings.system_prompt
+            base += ("\n\nتاریخ امروز: " + today_fa()
+                     + ". اگر پرسش درباره «امروز/الان» یا رویدادهای جاری بود، بر اساس همین تاریخ پاسخ بده.")
+            agent = AGENT_MAP.get(agent_id or "")
+            if agent and agent.get("prompt"):
+                base += "\n\n" + agent["prompt"]
             ctx = self._kb_context(last_user)
             if ctx:
-                base = base + KB_CONTEXT_HEADER + ctx + KB_CONTEXT_FOOTER
-            return base
+                base += KB_CONTEXT_HEADER + ctx + KB_CONTEXT_FOOTER
+            web_ctx, sources = self._web_block(last_user, force_search)
+            if web_ctx:
+                base += web_ctx
+            return base, sources
+
+        def _web_block(self, last_user, force_search):
+            """جستجوی وب و/یا خواندن لینک پیوست‌شده؛ خروجی: (بلوک زمینه، منابع)"""
+            query = (last_user or "").strip()
+            if not query or not settings.web_search:
+                return "", []
+            sources = []
+            parts = []
+            searched = False
+            try:
+                # ۱) لینک‌های داخل پیام همیشه خوانده می‌شوند (مستقل از دکمه جستجو)
+                for u in URL_RE.findall(query)[:2]:
+                    t = fetch_page_text(u, max_chars=1200, timeout=settings.search_timeout)
+                    if t:
+                        parts.append("[متن صفحهٔ درخواستی " + u + "]\n" + t)
+                        sources.append({"title": (t.split("\n")[0] or u)[:120], "url": u})
+                # ۲) جستجوی وب: با دکمه روشن یا وقتی کاربر صریحاً جستجو می‌خواهد
+                if force_search or SEARCH_INTENT_RE.search(query):
+                    searched = True
+                    res = web_search(query, max_results=6, timeout=settings.search_timeout)
+                    for i, r in enumerate(res):
+                        sources.append({"title": r["title"], "url": r["url"]})
+                        if i < 5:
+                            parts.append("[" + str(i + 1) + "] " + r["title"] + " — " + r["url"]
+                                         + ("\n" + r["snippet"] if r.get("snippet") else ""))
+                    # متن کامل چند نتیجهٔ اول
+                    for r in res[:settings.search_max_pages]:
+                        t = fetch_page_text(r["url"], max_chars=1200, timeout=settings.search_timeout)
+                        if t:
+                            parts.append("[متن صفحه: " + r["title"] + "]\n" + t)
+            except Exception:
+                pass
+            if not parts:
+                if searched:
+                    return ("\n\n=== جستجوی وب ===\nجستجوی وب نتیجه‌ای برنگرداند (احتمالاً سرور به اینترنت "
+                            "دسترسی ندارد یا پرسش خیلی خاص بود). صادقانه بگو و از دانش عمومی پاسخ بده.\n"), sources
+                return "", sources
+            head = WEB_CONTEXT_HEADER.replace("{date}", today_fa())
+            return head + "\n".join(parts[:6])[:4500] + WEB_CONTEXT_FOOTER, sources
+
+        def _vision_route(self, chosen):
+            """مدل مناسب برای پیام دارای عکس؛ خروجی: (model، اعلان برای کاربر یا None)"""
+            chosen = chosen or settings.model
+            if VISION_MODEL_PAT.match(chosen):
+                return chosen, None  # مدل انتخابی خودش بینایی‌دار است
+            vm = (settings.vision_model or "").strip()
+            if not vm:
+                return chosen, ("برای تحلیل عکس، مدل بینایی تنظیم نشده است "
+                                "(کلید vision_model در data/config.json).")
+            if not VISION_MODEL_PAT.match(vm):
+                return chosen, None
+            if vm not in list_models(settings):
+                return chosen, ("مدل بینایی «" + vm + "» روی سرور نصب نیست؛ یک بار در سرور اجرا کنید: "
+                                "ollama pull " + vm + "  (این پیام فعلاً با مدل متنی پاسخ گرفته شد)")
+            return vm, None
 
         def _inject_kb(self, msgs):
             """اگر کلاینت پیام system داشت، فقط اطلاعات سایت به آن افزوده می‌شود"""
@@ -1661,16 +2051,38 @@ def build_handler(settings, store, limiter, boot_ts, hist):
             model = body.get("model")
             if not (isinstance(model, str) and MODEL_RE.fullmatch(model)):
                 model = None
+            # ایجنت تخصصی + جستجوی وب (از بدنه درخواست صفحه چت)
+            agent_id = str(body.get("agent") or "general")
+            if agent_id not in AGENT_MAP:
+                agent_id = "general"
+            force_search = bool(body.get("web_search"))
+
+            # اگر عکس پیوست شده، به مدل بینایی مسیریابی شود
+            use_model, notice = model, None
+            last_user = next((m for m in reversed(msgs) if m["role"] == "user"), None)
+            if last_user and last_user.get("images"):
+                use_model, notice = self._vision_route(model)
+                if not (last_user.get("content") or "").strip():
+                    last_user["content"] = ("این تصویر را دقیق توصیف و تحلیل کن؛ "
+                                            "هر متن داخل تصویر را هم بخوان و اگر نکته روان‌شناختی دارد بگو.")
+
+            sources = []
             if not any(m["role"] == "system" for m in msgs):
-                msgs = [{"role": "system", "content": self._effective_system(msgs)}] + msgs
+                sys_text, sources = self._build_system(msgs, agent_id, force_search)
+                msgs = [{"role": "system", "content": sys_text}] + msgs
             else:
                 msgs = self._inject_kb(msgs)
 
             self._sse_headers()
+            try:
+                if notice:
+                    self._sse({"notice": notice})
+            except Exception:
+                pass
             ttft, full, last_stats = None, "", {}
             t0 = time.perf_counter()
             try:
-                for obj in ollama_chat_stream(settings, msgs, settings.max_output_tokens, model=model):
+                for obj in ollama_chat_stream(settings, msgs, settings.max_output_tokens, model=use_model):
                     if obj.get("done"):
                         last_stats = obj
                         break
@@ -1693,6 +2105,8 @@ def build_handler(settings, store, limiter, boot_ts, hist):
             wall = time.perf_counter() - t0
             stats = self._stats_from(last_stats, ttft if ttft is not None else wall, wall)
             try:
+                if sources:
+                    self._sse({"sources": sources[:8]})
                 self._sse({"done": True, "stats": stats})
             except Exception:
                 pass
@@ -1957,6 +2371,8 @@ def main():
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--ollama", default=None, help="آدرس سرور Ollama")
     ap.add_argument("--model", default=None)
+    ap.add_argument("--vision-model", default=None,
+                    help="مدل بینایی برای تحلیل عکس (پیش‌فرض qwen2.5vl:3b)")
     ap.add_argument("--ctx", type=int, default=None, help="طول زمینه (پیش‌فرض 8192)")
     ap.add_argument("--data-dir", default=None)
     ap.add_argument("--site-url", default=None,

@@ -21,6 +21,7 @@ param(
     [ValidateSet("run", "install", "restart", "diagnose", "remove", "status")][string]$Action = "run",
     [int]$Port = 8093,
     [string]$Model = "qwen3:8b",
+    [string]$VisionModel = "",
     [switch]$SetOllamaEnv
 )
 
@@ -43,7 +44,8 @@ switch ($Action) {
 
     "run" {
         Write-Host "اجرای سرور چت روی پورت $Port (توقف با Ctrl+C)..." -ForegroundColor Cyan
-        & $python "$dir\chat_server.py" --port $Port --model $Model
+        $extra = @(); if ($VisionModel) { $extra += @("--vision-model", $VisionModel) }
+        & $python "$dir\chat_server.py" --port $Port --model $Model @extra
     }
 
     "install" {
@@ -55,8 +57,10 @@ switch ($Action) {
         else { Write-Host "قانون فایروال از قبل موجود است." }
 
         Write-Host "=== ۲) ثبت سرویس (Scheduled Task با حساب SYSTEM) ===" -ForegroundColor Cyan
+        $argLine = "`"$dir\chat_server.py`" --port $Port --model $Model"
+        if ($VisionModel) { $argLine += " --vision-model $VisionModel" }
         $act = New-ScheduledTaskAction -Execute $python `
-            -Argument "`"$dir\chat_server.py`" --port $Port --model $Model" `
+            -Argument $argLine `
             -WorkingDirectory $dir
         $trg = New-ScheduledTaskTrigger -AtStartup
         Register-ScheduledTask -TaskName $taskName -Action $act -Trigger $trg `
