@@ -3,19 +3,22 @@
 .SYNOPSIS
     مدیریت سرویس چت وب LLM Rose روی Windows Server
 .DESCRIPTION
-    Action=run      اجرای مستقیم سرور در همین پنجره (برای تست)
-    Action=install  باز کردن فایروال + ثبت سرویس به‌صورت Scheduled Task (بالاآمدن خودکار با ویندوز) + اجرا
-    Action=remove   حذف سرویس
-    Action=status   وضعیت سرویس
-    -SetOllamaEnv   تنظیم OLLAMA_KEEP_ALIVE=-1 و بهینه‌سازی RAM (باعث می‌شود مدل همیشه در RAM بماند)
+    Action=run       اجرای مستقیم سرور در همین پنجره (برای دیدن خطاها هنگام تست)
+    Action=install   باز کردن فایروال + ثبت سرویس با حساب SYSTEM (بالاآمدن خودکار با ویندوز، مستقل از لاگین) + اجرا
+    Action=restart   توقف و اجرای مجدد سرویس (مثلاً بعد از git pull برای اعمال کد جدید)
+    Action=diagnose  عیب‌یابی گام‌به‌گام وقتی سایت/API بالا نمی‌آید
+    Action=remove    حذف سرویس
+    Action=status    وضعیت سرویس
+    -SetOllamaEnv    تنظیم OLLAMA_KEEP_ALIVE=-1 و بهینه‌سازی RAM (باعث می‌شود مدل همیشه در RAM بماند)
 .EXAMPLES
     powershell -ExecutionPolicy Bypass -File install_service.ps1 -Action install -Port 8093 -SetOllamaEnv
+    powershell -ExecutionPolicy Bypass -File install_service.ps1 -Action restart -Port 8093
+    powershell -ExecutionPolicy Bypass -File install_service.ps1 -Action diagnose -Port 8093
     powershell -ExecutionPolicy Bypass -File install_service.ps1 -Action run
-    powershell -ExecutionPolicy Bypass -File install_service.ps1 -Action status
 #>
 
 param(
-    [ValidateSet("run", "install", "remove", "status")][string]$Action = "run",
+    [ValidateSet("run", "install", "restart", "diagnose", "remove", "status")][string]$Action = "run",
     [int]$Port = 8093,
     [string]$Model = "qwen3:8b",
     [switch]$SetOllamaEnv
@@ -51,15 +54,15 @@ switch ($Action) {
         }
         else { Write-Host "قانون فایروال از قبل موجود است." }
 
-        Write-Host "=== ۲) ثبت سرویس (Scheduled Task) ===" -ForegroundColor Cyan
+        Write-Host "=== ۲) ثبت سرویس (Scheduled Task با حساب SYSTEM) ===" -ForegroundColor Cyan
         $act = New-ScheduledTaskAction -Execute $python `
             -Argument "`"$dir\chat_server.py`" --port $Port --model $Model" `
             -WorkingDirectory $dir
         $trg = New-ScheduledTaskTrigger -AtStartup
         Register-ScheduledTask -TaskName $taskName -Action $act -Trigger $trg `
-            -RunLevel Highest -Force `
+            -User "SYSTEM" -RunLevel Highest -Force `
             -Description "LLM Rose - Persian chat server + OpenAI-compatible API" | Out-Null
-        Write-Host "سرویس با نام $taskName ثبت شد (اجرای خودکار بعد از ری‌استارت ویندوز)."
+        Write-Host "سرویس با نام $taskName و حساب SYSTEM ثبت شد (مستقل از لاگین شما؛ بعد از ری‌استارت ویندوز هم خودش بالا می‌آید)."
 
         Write-Host "=== ۳) اجرای اولیه ===" -ForegroundColor Cyan
         Start-ScheduledTask -TaskName $taskName
@@ -69,13 +72,109 @@ switch ($Action) {
             Write-Host "سرویس فعال است: $($h | ConvertTo-Json -Compress)" -ForegroundColor Green
         }
         catch {
-            Write-Host "سرویس هنوز بالا نیامده؛ چند ثانیه بعد با Action=status بررسی کنید." -ForegroundColor Yellow
+            Write-Host "سرویس هنوز بالا نیامده؛ چند ثانیه بعد با Action=status یا Action=diagnose بررسی کنید." -ForegroundColor Yellow
         }
 
         Write-Host "`n=== ساخت اولین توکن API ===" -ForegroundColor Cyan
         & $python "$dir\chat_server.py" add-token --name "first-token"
         Write-Host "`nآدرس چت:  http://<IP-سرور>:$Port" -ForegroundColor Green
         Write-Host "نکته: اگر فایروال بیرونی (شرکت میزبانی/کلود) دارید، پورت $Port را آنجا هم باز کنید." -ForegroundColor Yellow
+    }
+
+    "restart" {
+        $t = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if (-not $t) {
+            Write-Host "تسک $taskName ثبت نشده است؛ اول Action=install را اجرا کنید." -ForegroundColor Red
+            return
+        }
+        Write-Host "توقف و اجرای مجدد سرویس (اعمال کد جدید)..." -ForegroundColor Cyan
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        Start-ScheduledTask -TaskName $taskName
+        Start-Sleep -Seconds 4
+        try {
+            $h = Invoke-RestMethod "http://localhost:$Port/health" -TimeoutSec 10
+            Write-Host "✓ سرویس با کد جدید فعال شد: $($h | ConvertTo-Json -Compress)" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "هنوز بالا نیامده؛ با Action=status یا Action=diagnose بررسی کنید." -ForegroundColor Yellow
+        }
+    }
+
+    "diagnose" {
+        Write-Host "=== عیب‌یابی سرویس چت (پورت $Port) ===" -ForegroundColor Cyan
+        $ok = $true
+
+        # ۱) تسک زمان‌بندی‌شده
+        $t = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($t) {
+            Write-Host "۱) تسک سرویس   : موجود — وضعیت: $($t.State)"
+            if ($t.State -ne "Running") {
+                Write-Host "   → سرویس اجرا نمی‌شود. راه‌حل:" -ForegroundColor Yellow
+                Write-Host "     Start-ScheduledTask -TaskName $taskName"
+                Write-Host "     یا:  powershell -ExecutionPolicy Bypass -File `"$dir\install_service.ps1`" -Action restart"
+                $ok = $false
+            }
+        } else {
+            Write-Host "۱) تسک سرویس   : ثبت نشده است!" -ForegroundColor Red
+            Write-Host "   → راه‌حل:" -ForegroundColor Yellow
+            Write-Host "     powershell -ExecutionPolicy Bypass -File `"$dir\install_service.ps1`" -Action install -Port $Port"
+            $ok = $false
+        }
+
+        # ۲) پورت گوش می‌دهد؟
+        $conn = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($conn) {
+            Write-Host "۲) پورت $Port   : در حال گوش‌دادن (PID $($conn.OwningProcess))"
+        } else {
+            Write-Host "۲) پورت $Port   : هیچ برنامه‌ای روی این پورت گوش نمی‌دهد!" -ForegroundColor Red
+            $ok = $false
+            if ($t -and $t.State -eq "Running") {
+                Write-Host "   → تسک Running است ولی پورت بسته است؛ یعنی سرور موقع اجرا خطا داده و بسته شده." -ForegroundColor Yellow
+                Write-Host "     برای دیدن متن خطا، اجرای مستقیم:" -ForegroundColor Yellow
+                Write-Host "     powershell -ExecutionPolicy Bypass -File `"$dir\install_service.ps1`" -Action run"
+            }
+        }
+
+        # ۳) سلامت محلی
+        if ($conn) {
+            try {
+                $h = Invoke-RestMethod "http://127.0.0.1:$Port/health" -TimeoutSec 5
+                Write-Host "۳) سلامت محلی  : پاسخ می‌دهد — status=$($h.status)"
+            } catch {
+                Write-Host "۳) سلامت محلی  : پورت باز است ولی /health پاسخ نمی‌دهد! $_" -ForegroundColor Red
+                $ok = $false
+            }
+        }
+
+        # ۴) فایروال ویندوز
+        $fw = Get-NetFirewallRule -DisplayName "LLM Rose Chat $Port" -ErrorAction SilentlyContinue
+        if ($fw -and "$($fw.Enabled)" -eq "True" -and "$($fw.Action)" -eq "Allow") {
+            Write-Host "۴) فایروال ویندوز: قانون باز برای پورت $Port موجود است"
+        } else {
+            Write-Host "۴) فایروال ویندوز: قانون باز وجود ندارد یا غیرفعال است!" -ForegroundColor Red
+            Write-Host "   → راه‌حل:" -ForegroundColor Yellow
+            Write-Host "     New-NetFirewallRule -DisplayName `"LLM Rose Chat $Port`" -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow"
+            $ok = $false
+        }
+
+        # ۵) Ollama (فقط هشدار — روی /health اثر ندارد)
+        try {
+            $null = Invoke-RestMethod "http://127.0.0.1:11434/api/tags" -TimeoutSec 5
+            Write-Host "۵) Ollama       : فعال است"
+        } catch {
+            Write-Host "۵) Ollama       : پاسخ نمی‌دهد (چت جواب نمی‌دهد ولی /health بالا می‌آید) — ollama serve را بررسی کنید" -ForegroundColor Yellow
+        }
+
+        Write-Host ""
+        if ($ok) {
+            Write-Host "✓ همه بررسی‌های داخل سرور سبز است." -ForegroundColor Green
+            Write-Host "اگر از بیرون باز نمی‌شود، مشکل خارج از ویندوز است:" -ForegroundColor Yellow
+            Write-Host "  • پورت $Port را در پنل فایروال شرکت میزبانی (پنل ابری سرور) هم باز کنید."
+            Write-Host "  • از سیستم خودتان تست کنید:  http://<IP-سرور>:$Port/health"
+        } else {
+            Write-Host "✗ یک یا چند مورد بالا قرمز است؛ راه‌حل‌های کنار هر مورد را اجرا کنید و دوباره diagnose بگیرید." -ForegroundColor Yellow
+        }
     }
 
     "remove" {

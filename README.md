@@ -298,6 +298,19 @@ powershell -ExecutionPolicy Bypass -File chat_server\install_service.ps1 -Action
 ```
 
 - `-SetOllamaEnv` متغیرهای بهینه (`OLLAMA_KEEP_ALIVE=-1` و ...) را ثبت می‌کند تا مدل همیشه در RAM بماند و تأخیر ۱۱ ثانیه‌ای پاسخ اول حذف شود.
+- سرویس با حساب **SYSTEM** ثبت می‌شود؛ یعنی با بستن RDP یا ری‌استارت ویندوز از کار نمی‌افتد و بعد از هر بوت خودش بالا می‌آید.
+- بعد از هر `git pull` برای اعمال کد جدید فقط سرویس را ری‌استارت کنید:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File chat_server\install_service.ps1 -Action restart -Port 8093
+```
+
+- اگر سایت یا `/health` باز نمی‌شود، عیب‌یابی گام‌به‌گام:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File chat_server\install_service.ps1 -Action diagnose -Port 8093
+```
+
 - حذف سرویس: `-Action remove` — بررسی وضعیت: `-Action status`
 
 ### ساخت و مدیریت توکن API
@@ -345,6 +358,8 @@ curl http://130.185.73.157:8093/v1/chat/completions \
 
 | مشکل | راه‌حل |
 |---|---|
+| سایت چت یا `/health` باز نمی‌شود (ERR_CONNECTION_TIMED_OUT) | روی سرور: `powershell -ExecutionPolicy Bypass -File chat_server\install_service.ps1 -Action diagnose -Port 8093`. اگر سرویس اجرا نیست: `-Action restart`. اگر همه موارد سبز بود، پورت 8093 را در پنل فایروال شرکت میزبانی هم باز کنید |
+| سرویس بعد از بستن RDP یا ری‌استارت ویندوز از کار افتاده | نسخه‌های قدیمی نصب‌کننده، تسک را با حساب کاربری ثبت می‌کردند. یک بار `-Action install` را دوباره اجرا کنید تا سرویس با حساب SYSTEM ثبت شود |
 | خطای کمبود RAM هنگام لود مدل | مدل کوچک‌تر (`qwen3:4b`)، بستن Docker/ClamAV، کاهش `OLLAMA_CONTEXT_LENGTH` به 4096 |
 | پاسخ‌دهی خیلی کند | `think:false`، مدل 4B، اطمینان از `OLLAMA_NUM_PARALLEL=1` |
 | از سیستم دیگر به API دسترسی نیست | بررسی `OLLAMA_HOST=0.0.0.0`، قانون فایروال پورت 11434، ری‌استارت Ollama |
