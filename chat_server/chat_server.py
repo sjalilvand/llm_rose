@@ -6,6 +6,9 @@ LLM Rose — سرور چت وب آنلاین + API سازگار با OpenAI هم
 
 امکانات:
   - صفحه چت وب فارسی (RTL) با پاسخ جریانی (استریم) روی پورت دلخواه (پیش‌فرض 8093)
+  - تم شب/روز با دکمه تغییر فوری (ذخیره در مرورگر کاربر)
+  - هویت «دستیار هوش مصنوعی کلینیک رز» + پاسخ خودکار از محتوای وب‌سایت کلینیک
+    (پایگاه دانش خودکار از صفحه اصلی، باندل JS سایت و APIهای عمومی — ماژول site_kb.py)
   - API سازگار با OpenAI:  POST /v1/chat/completions  و  GET /v1/models
   - سیستم توکن API (lr_...) با ساخت/لیست/ابطال و آمار مصرف هر توکن
   - محدودیت نرخ درخواست (per-token و per-IP برای صفحه عمومی)
@@ -20,6 +23,10 @@ LLM Rose — سرور چت وب آنلاین + API سازگار با OpenAI هم
     python chat_server.py list-tokens
     python chat_server.py revoke <شناسه>
     python chat_server.py show-admin-key
+
+پایگاه دانش سایت:
+    python chat_server.py refresh-site             # به‌روزرسانی دستی دانش سایت
+    (به‌روزرسانی خودکار هر ۱۲ ساعت؛ با کلید site_kb_refresh_hours در config.json)
 
 پس‌از اجرا:
     صفحه چت:        http://<IP-سرور>:8093
@@ -45,6 +52,12 @@ from types import SimpleNamespace
 from urllib import request as urlreq
 from urllib.error import HTTPError, URLError
 
+# ماژول پایگاه دانش سایت — اگر کنار سرور نباشد، سرور بدون آن هم کار می‌کند
+try:
+    import site_kb
+except ImportError:
+    site_kb = None
+
 if sys.platform == "win32":
     os.system("")
     try:
@@ -54,8 +67,34 @@ if sys.platform == "win32":
         pass
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_SYSTEM_PROMPT = ("تو یک دستیار فارسی‌زبان، دقیق و مودب هستی. "
+
+# پرامپت پیش‌فرض نسخه‌های قبلی — برای مهاجرت خودکار config.json کاربران قدیمی
+LEGACY_DEFAULT_PROMPT = ("تو یک دستیار فارسی‌زبان، دقیق و مودب هستی. "
                          "پاسخ‌ها کوتاه، مفید و به زبان فارسی باشند.")
+
+DEFAULT_SITE_URL = "http://130.185.73.157/"
+DEFAULT_APP_TITLE = "دستیار هوشمند رز"
+
+# هویت دستیار: با کلید system_prompt در config.json قابل تغییر است
+DEFAULT_SYSTEM_PROMPT = (
+    "تو «دستیار هوشمند رز» هستی؛ دستیار هوش مصنوعیِ شرکت مشاوره رز — کلینیک تخصصی مشاوره و روان‌درمانی (رزپسی).\n"
+    "هرگاه از تو پرسیدند «تو کیستی؟»، خودت را این‌گونه معرفی کن:\n"
+    "«من دستیار هوش مصنوعی کلینیک رز هستم؛ برای راهنمایی درباره خدمات مشاوره و روان‌درمانی، "
+    "نوبت‌دهی آنلاین، شعبه‌ها و پاسخ به پرسش‌های شما در خدمتم.»\n"
+    "قواعد پاسخ‌گویی:\n"
+    "۱) همیشه فارسی، کوتاه، گرم و حرفه‌ای بنویس.\n"
+    "۲) درباره خدمات، قیمت‌ها، شعبه‌ها و نوبت‌دهی فقط از «اطلاعات رسمی وب‌سایت» که در پیام سامانه ارسال می‌شود "
+    "استفاده کن؛ عدد، قیمت یا آدرس از خودت نساز.\n"
+    "۳) اگر پاسخ در اطلاعات رسمی نبود، صادقانه بگو و کاربر را به فرم درخواست مشاوره در سایت یا تماس با پذیرش هدایت کن.\n"
+    "۴) برای رزرو نوبت، کاربر را به بخش نوبت‌دهی آنلاین سایت هدایت کن.\n"
+    "۵) پرسش‌های عمومی روان‌شناسی را ساده و با احتیاط پاسخ بده؛ تشخیص و تجویز درمان مخصوص متخصص است. "
+    "در موارد بحرانی (مانند افکار خودآسیبی) فوراً به اورژانس ۱۲۳ یا پذیرش کلینیک ارجاع بده."
+)
+
+KB_CONTEXT_HEADER = ("\n\n=== اطلاعات رسمی وب‌سایت کلینیک (مبنای پاسخ به این پرسش) ===\n")
+KB_CONTEXT_FOOTER = ("\n=== پایان اطلاعات وب‌سایت ===\n"
+                     "برای خدمات، قیمت، آدرس شعبه‌ها و نوبت‌دهی فقط بر اساس همین اطلاعات پاسخ بده؛ "
+                     "اگر پاسخ کامل در این اطلاعات نبود، کاربر را به فرم درخواست مشاوره یا پذیرش هدایت کن.")
 
 # =====================================================================
 # تنظیمات (ذخیره در data/config.json — کلید ادمین در اولین اجرا ساخته می‌شود)
@@ -85,7 +124,19 @@ def load_settings(args):
     s.chat_public = cfg.get("chat_public", True)
     if getattr(args, "private", False):
         s.chat_public = False
-    s.system_prompt = cfg.get("system_prompt", DEFAULT_SYSTEM_PROMPT)
+    sp = cfg.get("system_prompt")
+    if sp and sp.strip() == LEGACY_DEFAULT_PROMPT.strip():
+        sp = None  # پرامپت پیش‌فرض قدیمی → مهاجرت به پرامپت هویت جدید
+    s.system_prompt = sp or DEFAULT_SYSTEM_PROMPT
+
+    # وب‌سایت و پایگاه دانش (RAG سبک)
+    s.site_url = ((getattr(args, "site_url", None) or cfg.get("site_url", DEFAULT_SITE_URL))
+                  or DEFAULT_SITE_URL).rstrip("/") + "/"
+    s.app_title = cfg.get("app_title", DEFAULT_APP_TITLE)
+    s.site_kb_enabled = bool(cfg.get("site_kb", True))
+    s.site_kb = s.site_kb_enabled and (site_kb is not None)
+    s.site_kb_refresh_hours = float(cfg.get("site_kb_refresh_hours", 12))
+    s.kb_context_chars = int(cfg.get("kb_context_chars", 1800))
     s.admin_key = cfg.get("admin_key") or secrets.token_hex(16)
 
     cfg.update({
@@ -94,9 +145,14 @@ def load_settings(args):
         "rate_web_per_min": s.rate_web_per_min,
         "rate_token_per_min": s.rate_token_per_min,
         "chat_public": s.chat_public, "system_prompt": s.system_prompt,
+        "site_url": s.site_url, "app_title": s.app_title,
+        "site_kb": s.site_kb_enabled, "site_kb_refresh_hours": s.site_kb_refresh_hours,
+        "kb_context_chars": s.kb_context_chars,
         "admin_key": s.admin_key,
     })
     cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    # صفحه HTML با عنوان و آدرس سایت پر می‌شود (یک‌بار در شروع)
+    s.html_page = HTML_PAGE.replace("__APP_TITLE__", s.app_title).replace("__SITE_URL__", s.site_url)
     return s
 
 
@@ -247,17 +303,22 @@ def ollama_chat_stream(settings, messages, num_predict):
 
 
 # =====================================================================
-# صفحه چت وب (تک‌فایل، RTL، تم تیره)
+# صفحه چت وب (تک‌فایل، RTL، تم شب/روز)
 # =====================================================================
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LLM Rose — چت هوشمند فارسی</title>
+<title>__APP_TITLE__ | کلینیک رز</title>
 <style>
 :root{--bg:#0f1117;--panel:#171a23;--panel2:#1e2230;--line:#2a2f40;--text:#e8eaf0;
---dim:#98a1b3;--accent:#e91e63;--accent2:#ff5c8d;--ok:#2ecc71;--err:#ff6b6b}
+--dim:#98a1b3;--accent:#e91e63;--accent2:#ff5c8d;--ok:#2ecc71;--err:#ff6b6b;
+--keybar-bg:#2a1620;--shadow:none;--user-b:#c2185b;color-scheme:dark}
+html[data-theme="light"]{--bg:#f3f5fa;--panel:#ffffff;--panel2:#e9edf5;--line:#d9e0ee;--text:#1d2333;
+--dim:#5f6b84;--accent:#d81b60;--accent2:#e91e63;--ok:#1e9e5a;--err:#d64545;
+--keybar-bg:#fdeef4;--shadow:0 1px 4px rgba(25,40,80,.10);--user-b:#ad1457;color-scheme:light}
+body,header,#composer,.msg,.badge,#guide,#inp,.stats,#keybar{transition:background-color .25s ease,color .25s ease,border-color .25s ease}
 *{box-sizing:border-box}
 html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--text);display:flex;flex-direction:column;
@@ -276,10 +337,10 @@ border-radius:20px;padding:4px 10px;color:var(--dim)}
 #chat{flex:1;overflow-y:auto;padding:18px 16px;display:flex;flex-direction:column;gap:12px}
 .msg{max-width:82%;padding:10px 14px;border-radius:14px;line-height:2;
 white-space:pre-wrap;word-wrap:break-word;font-size:14.5px}
-.user{align-self:flex-start;background:linear-gradient(135deg,var(--accent),#c2185b);
+.user{align-self:flex-start;background:linear-gradient(135deg,var(--accent),var(--user-b));
 color:#fff;border-bottom-right-radius:4px}
 .bot{align-self:flex-end;background:var(--panel);border:1px solid var(--line);
-border-bottom-left-radius:4px}
+border-bottom-left-radius:4px;box-shadow:var(--shadow)}
 .stats{font-size:11px;color:var(--dim);align-self:flex-end;background:var(--panel2);
 border:1px solid var(--line);border-radius:10px;padding:2px 8px}
 #guide{margin:0 16px;background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -298,20 +359,27 @@ button{border:0;border-radius:12px;padding:10px 18px;font-family:inherit;font-si
 cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--accent),#c2185b)}
 button:disabled{opacity:.45;cursor:not-allowed}
 #stop{background:var(--panel2);border:1px solid var(--line);color:var(--dim)}
-#keybar{display:none;gap:8px;padding:10px 16px;background:#2a1620;border-bottom:1px solid var(--accent)}
+#keybar{display:none;gap:8px;padding:10px 16px;background:var(--keybar-bg);border-bottom:1px solid var(--accent)}
 #keybar input{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);
 border-radius:8px;padding:8px 12px;font-family:inherit;outline:none}
+#themebtn{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+width:36px;height:32px;padding:0;font-size:15px;line-height:1;border-radius:10px}
+#themebtn:hover{border-color:var(--accent)}
+a.badge{text-decoration:none}
+a.badge:hover{color:var(--accent);border-color:var(--accent)}
 @media (max-width:640px){ .msg{max-width:94%} h1{font-size:14px} }
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">LR</div>
-  <h1>چت هوشمند فارسی</h1>
+  <div class="logo" title="__APP_TITLE__">R</div>
+  <h1>__APP_TITLE__</h1>
   <span class="badge"><span class="dot" id="dot"></span><span id="modelname">…</span></span>
   <span class="badge" id="speedbadge">سرعت: —</span>
+  <a class="badge" href="__SITE_URL__" target="_blank" rel="noopener" title="وب‌سایت کلینیک رز">وب‌سایت کلینیک ↗</a>
   <span class="spacer"></span>
   <span class="badge" id="clearbtn" style="cursor:pointer">پاک‌کردن گفتگو</span>
+  <button id="themebtn" title="تغییر تم شب/روز">🌙</button>
 </header>
 
 <div id="keybar">
@@ -319,7 +387,7 @@ border-radius:8px;padding:8px 12px;font-family:inherit;outline:none}
   <button id="keysave">ذخیره</button>
 </div>
 
-<div id="chat"></div>
+<div id="chat"><div class="msg bot" id="welcome">سلام 👋 من دستیار هوشمند کلینیک رز هستم؛ درباره خدمات، هزینه‌ها، شعبه‌ها و نوبت‌دهی آنلاین می‌توانم کمکتان کنم. بپرسید!</div></div>
 
 <details id="guide">
   <summary>راهنمای استفاده از API (برای برنامه‌های شما)</summary>
@@ -354,6 +422,20 @@ let messages = [];
 let busy = false;
 let ctl = null;
 
+// ---------- تم شب / روز ----------
+const rootEl = document.documentElement;
+const themeBtn = document.getElementById("themebtn");
+function applyTheme(t) {
+  rootEl.setAttribute("data-theme", t);
+  try { localStorage.setItem("lr_theme", t); } catch (e) {}
+  themeBtn.textContent = t === "light" ? "🌙" : "☀️";
+  themeBtn.title = t === "light" ? "رفتن به تم شب" : "رفتن به تم روز";
+}
+let savedTheme = null;
+try { savedTheme = localStorage.getItem("lr_theme"); } catch (e) {}
+applyTheme(savedTheme || ((window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark"));
+themeBtn.onclick = () => applyTheme(rootEl.getAttribute("data-theme") === "light" ? "dark" : "light");
+
 fetch("/health").then(r => r.json()).then(h => {
   document.getElementById("modelname").textContent = h.model;
   document.getElementById("dot").classList.add("on");
@@ -384,9 +466,11 @@ function addBubble(cls, text) {
 }
 function scrollDown() { chat.scrollTop = chat.scrollHeight; }
 
+const welcomeEl = document.getElementById("welcome");
 document.getElementById("clearbtn").onclick = () => {
   if (busy) return;
   messages = []; chat.innerHTML = "";
+  if (welcomeEl) chat.appendChild(welcomeEl);
 };
 
 function setBusy(b) {
@@ -481,10 +565,19 @@ def build_handler(settings, store, limiter, boot_ts):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
-        server_version = "LLMRose/1.0"
+        server_version = "LLMRose/1.1"
+
+        # ---------- مقاوم‌سازی اتصال (قطع ناگهانی مرورگر/هلت‌چک نباید Traceback چاپ کند) ----------
+        def handle(self):
+            try:
+                BaseHTTPRequestHandler.handle(self)
+            except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, TimeoutError):
+                self.close_connection = True
 
         # ---------- ابزارهای پایه ----------
         def log_message(self, fmt, *args):
+            if args and isinstance(args[0], str) and "/health" in args[0]:
+                return  # لاگ هلت‌چک‌های پرتکرار نمایش داده نشود
             print(f"{datetime.now().strftime('%H:%M:%S')} | {self.client_address[0]} | {fmt % args}",
                   flush=True)
 
@@ -548,11 +641,54 @@ def build_handler(settings, store, limiter, boot_ts):
                 "prompt_tokens": st.get("prompt_eval_count") or 0,
             }
 
+        # ---------- پایگاه دانش سایت ----------
+        def _kb_context(self, query):
+            """زمینه مرتبط از وب‌سایت؛ اگر چیزی مرتبط نبود، رشته خالی"""
+            if not (settings.site_kb and site_kb and getattr(settings, "kb", None)):
+                return ""
+            try:
+                return site_kb.build_context(settings.kb, query or "",
+                                             max_chars=settings.kb_context_chars)
+            except Exception:
+                return ""
+
+        def _effective_system(self, msgs):
+            """پرامپت هویت + (در صورت مرتبط بودن پرسش) اطلاعات رسمی سایت"""
+            base = settings.system_prompt
+            last_user = ""
+            for m in reversed(msgs):
+                if m.get("role") == "user":
+                    last_user = m.get("content") or ""
+                    break
+            ctx = self._kb_context(last_user)
+            if ctx:
+                base = base + KB_CONTEXT_HEADER + ctx + KB_CONTEXT_FOOTER
+            return base
+
+        def _inject_kb(self, msgs):
+            """اگر کلاینت پیام system داشت، فقط اطلاعات سایت به آن افزوده می‌شود"""
+            ctx_all = ""
+            last_user = ""
+            for m in reversed(msgs):
+                if m.get("role") == "user":
+                    last_user = m.get("content") or ""
+                    break
+            ctx_all = self._kb_context(last_user)
+            if not ctx_all:
+                return msgs
+            out = list(msgs)
+            for i, m in enumerate(out):
+                if m.get("role") == "system":
+                    out[i] = {"role": "system",
+                              "content": m["content"] + KB_CONTEXT_HEADER + ctx_all + KB_CONTEXT_FOOTER}
+                    break
+            return out
+
         # ---------- GET ----------
         def do_GET(self):
             path = self.path.split("?")[0]
             if path == "/":
-                data = HTML_PAGE.encode("utf-8")
+                data = settings.html_page.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
@@ -562,12 +698,18 @@ def build_handler(settings, store, limiter, boot_ts):
                 self.send_response(204)
                 self.end_headers()
             elif path == "/health":
+                kb = getattr(settings, "kb", None)
                 self._json(200, {
                     "status": "ok",
                     "service": "llm-rose-chat",
                     "model": settings.model,
                     "ollama": settings.ollama,
                     "chat_public": settings.chat_public,
+                    "site_kb": {
+                        "enabled": settings.site_kb,
+                        "chunks": len(kb["chunks"]) if kb else 0,
+                        "built_at": kb.get("built_at") if kb else None,
+                    },
                     "uptime_s": int(time.time() - boot_ts),
                 })
             elif path == "/v1/models":
@@ -632,7 +774,9 @@ def build_handler(settings, store, limiter, boot_ts):
             if not msgs:
                 return self._json(400, {"error": "پیامی ارسال نشده است"})
             if not any(m["role"] == "system" for m in msgs):
-                msgs = [{"role": "system", "content": settings.system_prompt}] + msgs
+                msgs = [{"role": "system", "content": self._effective_system(msgs)}] + msgs
+            else:
+                msgs = self._inject_kb(msgs)
 
             self._sse_headers()
             ttft, full, last_stats = None, "", {}
@@ -687,7 +831,9 @@ def build_handler(settings, store, limiter, boot_ts):
                 return self._json(400, {"error": {"message": "messages الزامی است",
                                                   "type": "invalid_request_error"}})
             if not any(m["role"] == "system" for m in msgs):
-                msgs = [{"role": "system", "content": settings.system_prompt}] + msgs
+                msgs = [{"role": "system", "content": self._effective_system(msgs)}] + msgs
+            else:
+                msgs = self._inject_kb(msgs)
 
             stream = bool(body.get("stream", False))
             try:
@@ -795,6 +941,46 @@ def build_handler(settings, store, limiter, boot_ts):
 
 
 # =====================================================================
+# پایگاه دانش سایت: بارگذاری + به‌روزرسانی خودکار در پس‌زمینه
+# =====================================================================
+def load_kb_into(settings):
+    """بارگذاری KB موجود از فایل؛ خروجی: dict یا None"""
+    if not settings.site_kb:
+        return None
+    kb = site_kb.load_kb(settings.data_dir / "site_kb.json")
+    if kb:
+        settings.kb = kb
+        print(f"  پایگاه دانش   : فعال — {len(kb['chunks'])} قطعه (ساخته {kb.get('built_at')})")
+    else:
+        settings.kb = None
+        print("  پایگاه دانش   : هنوز ساخته نشده — در پس‌زمینه ساخته می‌شود…")
+    return kb
+
+
+def kb_refresh_loop(settings):
+    """حلقه پس‌زمینه: اگر فایل نبود یا قدیمی شد، دوباره از سایت می‌سازد"""
+    path = settings.data_dir / "site_kb.json"
+    check_every_s = 1800  # هر ۳۰ دقیقه وضعیت را بررسی کن
+    while True:
+        try:
+            stale = True
+            if path.exists():
+                age_h = (time.time() - path.stat().st_mtime) / 3600.0
+                stale = age_h >= max(settings.site_kb_refresh_hours, 0.5)
+            if stale:
+                data, err = site_kb.build_kb(settings.site_url, path,
+                                             log=lambda m: print(f"[KB] {m}", flush=True))
+                if data:
+                    settings.kb = site_kb.load_kb(path) or settings.kb
+                    print(f"[KB] پایگاه دانش آماده شد: {len(data['chunks'])} قطعه", flush=True)
+                elif err:
+                    print(f"[KB] به‌روزرسانی ناموفق: {err}", flush=True)
+        except Exception as exc:
+            print(f"[KB] خطای غیرمنتظره: {exc}", flush=True)
+        time.sleep(check_every_s)
+
+
+# =====================================================================
 # اجرای سرور
 # =====================================================================
 def local_ips():
@@ -825,6 +1011,7 @@ def run_server(settings):
     print("=" * 64)
     print(f"  مدل           : {settings.model}   (Ollama: {settings.ollama})")
     print(f"  چت عمومی      : {'بله (برای قفل‌کردن chat_public=false در config.json)' if settings.chat_public else 'خیر — کلید API لازم است'}")
+    print(f"  هویت دستیار   : {settings.app_title}  (سایت: {settings.site_url})")
     print(f"  پوشه داده     : {settings.data_dir}")
     print(f"  کلید ادمین    : {settings.admin_key}")
     print("  برای ساخت توکن: python chat_server.py add-token --name \"نام\"")
@@ -833,6 +1020,12 @@ def run_server(settings):
         print(f"  چت وب         : http://{ip}:{settings.port}")
     print(f"  API (OpenAI)  : http://<IP-سرور>:{settings.port}/v1/chat/completions")
     print("=" * 64)
+
+    load_kb_into(settings)
+    if settings.site_kb:
+        threading.Thread(target=kb_refresh_loop, args=(settings,), daemon=True).start()
+    elif not site_kb and settings.site_kb_enabled:
+        print("  توجه: فایل site_kb.py کنار سرور نیست؛ پاسخ از محتوای سایت غیرفعال است.")
 
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
     server.daemon_threads = True
@@ -865,7 +1058,7 @@ def main():
 
     ap = argparse.ArgumentParser(description="سرور چت وب + API فارسی (LLM Rose)")
     ap.add_argument("command", nargs="?", default="serve",
-                    help="serve (پیش‌فرض) | add-token | list-tokens | revoke | show-admin-key")
+                    help="serve (پیش‌فرض) | add-token | list-tokens | revoke | show-admin-key | refresh-site")
     ap.add_argument("--name", help="نام توکن (برای add-token)")
     ap.add_argument("ident", nargs="?", help="شناسه توکن (برای revoke)")
     ap.add_argument("--host", default=None)
@@ -874,6 +1067,8 @@ def main():
     ap.add_argument("--model", default=None)
     ap.add_argument("--ctx", type=int, default=None, help="طول زمینه (پیش‌فرض 8192)")
     ap.add_argument("--data-dir", default=None)
+    ap.add_argument("--site-url", default=None,
+                    help="آدرس وب‌سایت کلینیک برای پایگاه دانش (پیش‌فرض از config.json)")
     ap.add_argument("--private", action="store_true",
                     help="چت وب فقط با کلید API (به‌جای عمومی)")
     args = ap.parse_args(argv)
@@ -884,6 +1079,20 @@ def main():
     cmd = args.command
     if cmd == "serve":
         run_server(settings)
+    elif cmd == "refresh-site":
+        if not site_kb:
+            print("ماژول site_kb.py کنار chat_server.py نیست؛ به‌روزرسانی ممکن نیست.")
+            sys.exit(1)
+        print(f"به‌روزرسانی پایگاه دانش از: {settings.site_url}")
+        data, err = site_kb.build_kb(settings.site_url, settings.data_dir / "site_kb.json", log=print)
+        if data:
+            print(f"✓ {len(data['chunks'])} قطعه دانش ذخیره شد: {settings.data_dir / 'site_kb.json'}")
+            if data.get("errors"):
+                print(f"  هشدارها: {'؛ '.join(data['errors'])}")
+            print("  (سرور در حال اجرا ظرف حداکثر ۳۰ دقیقه خودش آن را می‌بیند؛ برای اعمال فوری، سرور را ری‌استارت کنید)")
+        else:
+            print(f"✗ ناموفق: {err}")
+            sys.exit(1)
     elif cmd == "add-token":
         raw, rec = store.create(args.name or "token")
         print("=" * 56)
