@@ -6,7 +6,9 @@ LLM Rose — سرور چت وب آنلاین + API سازگار با OpenAI هم
 
 امکانات:
   - صفحه چت وب فارسی (RTL) با پاسخ جریانی (استریم) روی پورت دلخواه (پیش‌فرض 8093)
-  - تم شب/روز با دکمه تغییر فوری (ذخیره در مرورگر کاربر)
+  - تم شب/روز + انتخاب مدل + سایدبار گفتگوها + تاریخچه ماندگار (سرور + مرورگر)
+  - پیوست فایل: عکس، Word (docx)، Excel (xlsx)، PowerPoint (pptx)، PDF و متنی (استخراج متن فقط با کتابخانه استاندارد)
+  - اجرای کد HTML/JS داخل صفحه، رندر نمودار فرایند (زیرمجموعه mermaid)، کپی پیام‌ها و کدها
   - هویت «دستیار هوش مصنوعی کلینیک رز» + پاسخ خودکار از محتوای وب‌سایت کلینیک
     (پایگاه دانش خودکار از صفحه اصلی، باندل JS سایت و APIهای عمومی — ماژول site_kb.py)
   - API سازگار با OpenAI:  POST /v1/chat/completions  و  GET /v1/models
@@ -36,14 +38,20 @@ LLM Rose — سرور چت وب آنلاین + API سازگار با OpenAI هم
 """
 
 import argparse
+import base64
 import hashlib
+import html as html_lib
+import io
 import json
 import os
+import re
 import secrets
 import socket
 import sys
 import threading
 import time
+import zipfile
+import zlib
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +59,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib import request as urlreq
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
 
 # ماژول پایگاه دانش سایت — اگر کنار سرور نباشد، سرور بدون آن هم کار می‌کند
 try:
@@ -88,7 +97,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "۳) اگر پاسخ در اطلاعات رسمی نبود، صادقانه بگو و کاربر را به فرم درخواست مشاوره در سایت یا تماس با پذیرش هدایت کن.\n"
     "۴) برای رزرو نوبت، کاربر را به بخش نوبت‌دهی آنلاین سایت هدایت کن.\n"
     "۵) پرسش‌های عمومی روان‌شناسی را ساده و با احتیاط پاسخ بده؛ تشخیص و تجویز درمان مخصوص متخصص است. "
-    "در موارد بحرانی (مانند افکار خودآسیبی) فوراً به اورژانس ۱۲۳ یا پذیرش کلینیک ارجاع بده."
+    "در موارد بحرانی (مانند افکار خودآسیبی) فوراً به اورژانس ۱۲۳ یا پذیرش کلینیک ارجاع بده.\n"
+    "۶) قالب پاسخ: مارک‌داون ساده (تیتر با ##، لیست با -، پررنگ با **…**)؛ کدها همیشه داخل بلوک سه‌بک‌تیک با نام زبان؛ "
+    "اگر کاربر کد HTML خواست، یک سند کامل و قابل‌اجرا با <!DOCTYPE html> بده.\n"
+    "۷) اگر کاربر «نمودار، فرایند، فلوچارت یا مدل» خواست، یک بلوک ```mermaid بساز با فقط این قواعد: "
+    "خط اول flowchart TD (یا LR)، گره‌ها به‌شکل A[متن] یا A(متن) یا A{متن}، یال‌ها فقط --> یا -.-> یا --- "
+    "و برچسب یال با |متن|. از subgraph، classDef، استایل و نویسه‌های خاص داخل متن پرهیز کن."
 )
 
 KB_CONTEXT_HEADER = ("\n\n=== اطلاعات رسمی وب‌سایت کلینیک (مبنای پاسخ به این پرسش) ===\n")
@@ -266,11 +280,216 @@ class RateLimiter:
 
 
 # =====================================================================
+# استخراج متن از فایل‌های پیوست (docx / xlsx / pptx / pdf / متنی) — فقط کتابخانه استاندارد
+# =====================================================================
+ATTACH_MAX_CHARS = 12000
+TEXT_EXTS = {"txt", "csv", "md", "log", "json", "py", "js", "css", "html", "htm",
+             "xml", "yml", "yaml", "tsv", "ini", "sql", "ts", "jsx", "tsx"}
+IMG_EXTS = {"png", "jpg", "jpeg", "gif", "webp", "bmp"}
+
+
+def _x_docx(data):
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        xml = z.read("word/document.xml").decode("utf-8", errors="replace")
+    xml = re.sub(r"</w:p>", "\n", xml)
+    xml = re.sub(r"<w:tab[^>]*/>", "\t", xml)
+    xml = re.sub(r"<w:br[^>]*/>", "\n", xml)
+    txt = re.sub(r"<[^>]+>", "", xml)
+    return html_lib.unescape(txt)
+
+
+def _x_pptx(data):
+    out = []
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for name in sorted(n for n in z.namelist()
+                           if re.match(r"ppt/slides/slide\d+\.xml$", n)):
+            xml = z.read(name).decode("utf-8", errors="replace")
+            texts = [html_lib.unescape(t) for t in re.findall(r"<a:t>([^<]*)</a:t>", xml)]
+            if texts:
+                out.append(" — ".join(texts))
+    return "\n".join(out)
+
+
+def _x_xlsx(data):
+    lines = []
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        shared = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            ss = z.read("xl/sharedStrings.xml").decode("utf-8", errors="replace")
+            shared = [html_lib.unescape(re.sub(r"<[^>]+>", "", m))
+                      for m in re.findall(r"<si>(.*?)</si>", ss, re.S)]
+        sheets = sorted(n for n in z.namelist()
+                        if re.match(r"xl/worksheets/sheet\d+\.xml$", n))
+        for sh in sheets:
+            x = z.read(sh).decode("utf-8", errors="replace")
+            for row in re.findall(r"<row[^>]*>(.*?)</row>", x, re.S)[:2000]:
+                cells = []
+                for cm in re.finditer(r"<c([^>]*)>(.*?)</c>", row, re.S):
+                    attrs, inner = cm.group(1), cm.group(2)
+                    v = re.search(r"<v>([^<]*)</v>", inner)
+                    t = re.search(r"<t[^>]*>([^<]*)</t>", inner)
+                    if 't="s"' in attrs and v:
+                        try:
+                            val = shared[int(v.group(1))]
+                        except (ValueError, IndexError):
+                            val = v.group(1)
+                    elif t:
+                        val = t.group(1)
+                    elif v:
+                        val = v.group(1)
+                    else:
+                        val = ""
+                    cells.append(val)
+                if any(c.strip() for c in cells):
+                    lines.append(" | ".join(cells))
+    return "\n".join(lines)
+
+
+def _x_pdf(data):
+    """استخراج سادهٔ متن PDF (بهترین تلاش — PDFهای اسکنی متن ندارند)"""
+    texts = []
+    for m in re.finditer(rb"stream\r?\n(.*?)endstream", data, re.S):
+        chunk = m.group(1)
+        try:
+            d = zlib.decompress(chunk)
+        except Exception:
+            d = chunk
+        for om in re.finditer(rb"\[((?:[^\[\]\\]|\\.)*)\]\s*TJ|\(((?:[^()\\]|\\.)*)\)\s*Tj", d):
+            if om.group(1) is not None:
+                parts = re.findall(rb"\(((?:[^()\\]|\\.)*)\)", om.group(1))
+                s = b"".join(parts)
+            else:
+                s = om.group(2)
+            s = s.replace(b"\\(", b"(").replace(b"\\)", b")").replace(b"\\\\", b"\\")
+            try:
+                texts.append(s.decode("utf-16-be", errors="replace")
+                             if s.startswith(b"\xfe\xff")
+                             else s.decode("latin-1", errors="replace"))
+            except Exception:
+                pass
+        if len(texts) > 4000:
+            break
+    return "\n".join(texts)
+
+
+def extract_text_from(name, data):
+    """خروجی: (متن، نوع) — نوع: text/docx/xlsx/pptx/pdf/image/doc-legacy/binary"""
+    ext = (name.rsplit(".", 1)[-1] if "." in name else "").lower()
+    if ext in IMG_EXTS:
+        return "", "image"
+    try:
+        if ext == "docx":
+            return _x_docx(data)[:ATTACH_MAX_CHARS], "docx"
+        if ext == "pptx":
+            return _x_pptx(data)[:ATTACH_MAX_CHARS], "pptx"
+        if ext in ("xlsx", "xlsm"):
+            return _x_xlsx(data)[:ATTACH_MAX_CHARS], "xlsx"
+        if ext == "pdf":
+            return _x_pdf(data)[:ATTACH_MAX_CHARS], "pdf"
+    except Exception:
+        return "", "binary"
+    if ext == "doc":
+        return "", "doc-legacy"
+    if ext in TEXT_EXTS or ext == "":
+        try:
+            return data.decode("utf-8", errors="replace")[:ATTACH_MAX_CHARS], "text"
+        except Exception:
+            pass
+    return "", "binary"
+
+
+# =====================================================================
+# تاریخچه گفتگوها — پشتیبان سمت سرور برای مرورگر کاربر (هر uid یک فایل)
+# =====================================================================
+class HistoryStore:
+    def __init__(self, data_dir):
+        self.dir = Path(data_dir) / "history"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def safe_uid(uid):
+        return isinstance(uid, str) and bool(re.fullmatch(r"[A-Za-z0-9_-]{8,64}", uid))
+
+    def _path(self, uid):
+        return self.dir / (uid + ".json")
+
+    def load(self, uid):
+        try:
+            return json.loads(self._path(uid).read_text(encoding="utf-8")).get("chats", [])
+        except Exception:
+            return []
+
+    def save(self, uid, chats):
+        if not isinstance(chats, list):
+            raise ValueError("chats باید لیست باشد")
+        slim = []
+        for c in chats[:80]:
+            if not isinstance(c, dict):
+                continue
+            cc = {"id": str(c.get("id") or secrets.token_hex(6)),
+                  "title": str(c.get("title") or "گفتگو")[:80],
+                  "updated": str(c.get("updated") or ""),
+                  "msgs": []}
+            for m in (c.get("msgs") or [])[:120]:
+                if not isinstance(m, dict):
+                    continue
+                mm = {"role": m.get("role"), "content": str(m.get("content") or "")[:12000]}
+                if isinstance(m.get("att"), list) and m["att"]:
+                    mm["att"] = [{"name": str(a.get("name") or "")[:80],
+                                  "kind": str(a.get("kind") or "file")}
+                                 for a in m["att"][:6]]
+                cc["msgs"].append(mm)
+            slim.append(cc)
+        data = {"version": 1, "updated": datetime.now().isoformat(timespec="seconds"),
+                "chats": slim}
+        with self.lock:
+            tmp = self._path(uid).with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self._path(uid))
+
+    def delete(self, uid, chat_id=None):
+        with self.lock:
+            if chat_id is None:
+                try:
+                    self._path(uid).unlink()
+                except FileNotFoundError:
+                    pass
+                return
+            chats = [c for c in self.load(uid) if c.get("id") != chat_id]
+            self.save(uid, chats)
+
+
+# لیست مدل‌های Ollama با کش ۶۰ ثانیه‌ای (برای انتخاب‌مدل در صفحه چت)
+_ol_models_cache = {"t": 0.0, "names": []}
+
+
+def list_models(settings):
+    now = time.time()
+    if now - _ol_models_cache["t"] > 60:
+        try:
+            r = urlreq.urlopen(settings.ollama + "/api/tags", timeout=5)
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+            names = [m.get("name") for m in data.get("models", []) if m.get("name")]
+            if names:
+                _ol_models_cache.update(t=now, names=names)
+        except Exception:
+            pass
+    names = list(_ol_models_cache["names"])
+    if settings.model and settings.model not in names:
+        names.insert(0, settings.model)
+    return names or [settings.model]
+
+
+MODEL_RE = re.compile(r"[A-Za-z0-9._:\-/]{1,64}")
+
+
+# =====================================================================
 # ارتباط با Ollama
 # =====================================================================
-def ollama_chat_stream(settings, messages, num_predict):
+def ollama_chat_stream(settings, messages, num_predict, model=None):
     payload = {
-        "model": settings.model,
+        "model": model if model and MODEL_RE.fullmatch(model) else settings.model,
         "messages": messages,
         "stream": True,
         "think": False,  # پاسخ سریع روی CPU؛ برای سرعت حالت تفکر خاموش است
@@ -305,25 +524,43 @@ def ollama_chat_stream(settings, messages, num_predict):
 # =====================================================================
 # صفحه چت وب (تک‌فایل، RTL، تم شب/روز)
 # =====================================================================
-HTML_PAGE = r"""<!DOCTYPE html>
+HTML_PAGE = r"""
+<!DOCTYPE html>
 <html lang="fa" dir="rtl">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>__APP_TITLE__ | کلینیک رز</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='16' fill='%23e91e63'/%3E%3Ctext x='16' y='22' font-size='18' font-weight='bold' text-anchor='middle' fill='white' font-family='Arial'%3ER%3C/text%3E%3C/svg%3E">
 <style>
 :root{--bg:#0f1117;--panel:#171a23;--panel2:#1e2230;--line:#2a2f40;--text:#e8eaf0;
 --dim:#98a1b3;--accent:#e91e63;--accent2:#ff5c8d;--ok:#2ecc71;--err:#ff6b6b;
---keybar-bg:#2a1620;--shadow:none;--user-b:#c2185b;color-scheme:dark}
+--keybar-bg:#2a1620;--shadow:none;--user-b:#c2185b;--codebg:#0d0f14;color-scheme:dark}
 html[data-theme="light"]{--bg:#f3f5fa;--panel:#ffffff;--panel2:#e9edf5;--line:#d9e0ee;--text:#1d2333;
 --dim:#5f6b84;--accent:#d81b60;--accent2:#e91e63;--ok:#1e9e5a;--err:#d64545;
---keybar-bg:#fdeef4;--shadow:0 1px 4px rgba(25,40,80,.10);--user-b:#ad1457;color-scheme:light}
-body,header,#composer,.msg,.badge,#guide,#inp,.stats,#keybar{transition:background-color .25s ease,color .25s ease,border-color .25s ease}
+--keybar-bg:#fdeef4;--shadow:0 1px 4px rgba(25,40,80,.10);--user-b:#ad1457;--codebg:#f0f2f8;color-scheme:light}
 *{box-sizing:border-box}
 html,body{height:100%}
-body{margin:0;background:var(--bg);color:var(--text);display:flex;flex-direction:column;
-font-family:"Vazirmatn",Vazir,Tahoma,"Segoe UI",sans-serif}
-header{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--panel);
+body{margin:0;background:var(--bg);color:var(--text);font-family:"Vazirmatn",Vazir,Tahoma,"Segoe UI",sans-serif}
+#app{display:flex;height:100%}
+/* ---------- سایدبار گفتگوها ---------- */
+#side{width:262px;flex:0 0 262px;background:var(--panel);border-left:1px solid var(--line);
+display:flex;flex-direction:column;transition:margin .25s ease}
+#side.hide{margin-right:-262px}
+#newchat{margin:12px;border-radius:12px;padding:11px;font-size:14px;font-weight:600}
+#chatlist{flex:1;overflow-y:auto;padding:0 10px 10px}
+.citem{padding:9px 12px;border-radius:10px;cursor:pointer;font-size:13px;margin-bottom:4px;
+display:flex;align-items:center;gap:6px;border:1px solid transparent}
+.citem:hover{background:var(--panel2)}
+.citem.on{background:var(--panel2);border-color:var(--accent)}
+.citem .ct{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.citem .cd{font-size:11px;color:var(--dim)}
+.citem .cdel{opacity:.45;font-size:13px;padding:2px 4px;border-radius:6px}
+.citem .cdel:hover{opacity:1;background:var(--err);color:#fff}
+.sidefoot{padding:10px 14px;font-size:11px;color:var(--dim);border-top:1px solid var(--line);line-height:1.9}
+/* ---------- بخش اصلی ---------- */
+#main{flex:1;display:flex;flex-direction:column;min-width:0}
+header{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--panel);
 border-bottom:1px solid var(--line);flex-wrap:wrap}
 .logo{width:34px;height:34px;border-radius:50%;flex:0 0 auto;
 background:linear-gradient(135deg,var(--accent),#8e24aa);display:flex;align-items:center;
@@ -334,23 +571,81 @@ border-radius:20px;padding:4px 10px;color:var(--dim)}
 .dot{width:9px;height:9px;border-radius:50%;background:#666;display:inline-block;margin-left:5px}
 .dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
 .spacer{flex:1}
+#burger{background:var(--panel2);border:1px solid var(--line);color:var(--text);width:34px;
+height:32px;border-radius:10px;font-size:16px;padding:0;display:none}
+#modelsel{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+border-radius:20px;padding:4px 10px;font-family:inherit;font-size:12px;outline:none;max-width:150px}
+#themebtn{background:var(--panel2);border:1px solid var(--line);color:var(--text);
+width:36px;height:32px;padding:0;font-size:15px;line-height:1;border-radius:10px}
+#themebtn:hover{border-color:var(--accent)}
+a.badge{text-decoration:none}
+a.badge:hover{color:var(--accent);border-color:var(--accent)}
+#keybar{display:none;gap:8px;padding:10px 16px;background:var(--keybar-bg);border-bottom:1px solid var(--accent)}
+#keybar input{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);
+border-radius:8px;padding:8px 12px;font-family:inherit;outline:none}
+/* ---------- چت ---------- */
 #chat{flex:1;overflow-y:auto;padding:18px 16px;display:flex;flex-direction:column;gap:12px}
-.msg{max-width:82%;padding:10px 14px;border-radius:14px;line-height:2;
-white-space:pre-wrap;word-wrap:break-word;font-size:14.5px}
+.msg{max-width:84%;padding:10px 14px;border-radius:14px;line-height:2;font-size:14.5px;
+word-wrap:break-word;overflow-wrap:anywhere}
 .user{align-self:flex-start;background:linear-gradient(135deg,var(--accent),var(--user-b));
 color:#fff;border-bottom-right-radius:4px}
 .bot{align-self:flex-end;background:var(--panel);border:1px solid var(--line);
 border-bottom-left-radius:4px;box-shadow:var(--shadow)}
+.msg.errm{border-color:var(--err)}
+.msgfoot{display:flex;gap:6px;margin-top:6px;justify-content:flex-start}
+.mbtn{font-size:11px;background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+border-radius:8px;padding:2px 10px;cursor:pointer;font-family:inherit}
+.mbtn:hover{color:var(--accent);border-color:var(--accent)}
 .stats{font-size:11px;color:var(--dim);align-self:flex-end;background:var(--panel2);
 border:1px solid var(--line);border-radius:10px;padding:2px 8px}
-#guide{margin:0 16px;background:var(--panel);border:1px solid var(--line);border-radius:12px;
-font-size:12.5px;color:var(--dim)}
-#guide summary{cursor:pointer;padding:8px 14px;color:var(--dim)}
-#guide div{padding:0 14px 12px;line-height:2.1}
-#guide pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;
-padding:8px 12px;overflow-x:auto;direction:ltr;text-align:left;font-size:12px}
+/* ---------- مارک‌داون داخل پیام ربات ---------- */
+.bot p{margin:2px 0}
+.bot h4,.bot h5{margin:10px 0 2px;color:var(--accent2)}
+.bot ul,.bot ol{margin:4px 0;padding-right:22px}
+.bot blockquote{margin:6px 0;padding:4px 12px;border-right:3px solid var(--accent);
+background:var(--panel2);border-radius:8px;color:var(--dim)}
+.bot a{color:var(--accent2)}
+.bot .ic{background:var(--codebg);border:1px solid var(--line);border-radius:6px;
+padding:1px 6px;direction:ltr;unicode-bidi:embed;font-size:13px;font-family:Consolas,Menlo,monospace}
+.bot hr{border:0;border-top:1px dashed var(--line)}
+/* ---------- بلوک کد ---------- */
+.codebox{direction:ltr;text-align:left;background:var(--codebg);border:1px solid var(--line);
+border-radius:12px;margin:8px 0;overflow:hidden}
+.codehead{display:flex;align-items:center;gap:6px;padding:5px 10px;background:var(--panel2);
+border-bottom:1px solid var(--line)}
+.codehead .lang{font-size:11px;color:var(--dim);font-family:Consolas,monospace;flex:1}
+.codebtn{font-size:11px;border:1px solid var(--line);background:var(--panel);color:var(--dim);
+border-radius:7px;padding:2px 9px;cursor:pointer;font-family:inherit}
+.codebtn:hover{color:var(--accent);border-color:var(--accent)}
+.codebox pre{margin:0;padding:10px 12px;overflow-x:auto;font-size:12.5px;line-height:1.8;
+font-family:Consolas,Menlo,"Courier New",monospace;color:var(--text)}
+.tok-str{color:#7ec699}.tok-com{color:#8a93a5;font-style:italic}.tok-kw{color:#e48ac2}
+.tok-tag{color:#6cb2f7}.tok-attr{color:#d9b36c}.tok-num{color:#e5a66b}
+html[data-theme="light"] .tok-str{color:#1e7d46}html[data-theme="light"] .tok-com{color:#7c8798}
+html[data-theme="light"] .tok-kw{color:#b0308a}html[data-theme="light"] .tok-tag{color:#1565c0}
+html[data-theme="light"] .tok-attr{color:#9a6b00}html[data-theme="light"] .tok-num{color:#a05a12}
+.codeout{border-top:1px dashed var(--line);max-height:360px;overflow:auto}
+.codeout iframe{display:block;width:100%;height:340px;border:0;background:#fff}
+.jout{font:12px/1.9 Consolas,monospace;padding:6px 12px;direction:ltr;text-align:left;color:var(--text)}
+.jout .je{color:var(--err)}.jout .jw{color:#d9a03c}
+/* ---------- نمودار ---------- */
+.diagram{background:var(--panel2);border:1px dashed var(--line);border-radius:12px;
+padding:10px;margin:8px 0;overflow:auto;text-align:center}
+.diagram svg{max-width:100%;height:auto}
+/* ---------- پیوست‌ها ---------- */
+.chip{display:inline-flex;align-items:center;gap:6px;background:rgba(255,255,255,.16);
+border:1px solid rgba(255,255,255,.35);border-radius:10px;padding:2px 10px;margin:3px 2px;
+font-size:12px;max-width:100%}
+.chip .cn{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:170px}
+.chip .cx{cursor:pointer;font-weight:700;opacity:.7}.chip .cx:hover{opacity:1}
+.chip.cker{background:rgba(0,0,0,.25);border-color:var(--err)}
+.bot .chip,.msghist .chip{background:var(--panel2);border:1px solid var(--line);color:var(--dim)}
+#attachbar{display:none;flex-wrap:wrap;gap:2px;padding:6px 16px 0;background:var(--panel)}
 #composer{display:flex;gap:8px;padding:12px 16px;background:var(--panel);
 border-top:1px solid var(--line);align-items:flex-end}
+#attach{background:var(--panel2);border:1px solid var(--line);color:var(--dim);width:42px;
+height:42px;border-radius:12px;font-size:18px;padding:0;flex:0 0 auto}
+#attach:hover{color:var(--accent);border-color:var(--accent)}
 #inp{flex:1;resize:none;background:var(--panel2);border:1px solid var(--line);color:var(--text);
 border-radius:12px;padding:10px 14px;font-family:inherit;font-size:14.5px;outline:none;
 max-height:140px;line-height:1.8}
@@ -359,209 +654,719 @@ button{border:0;border-radius:12px;padding:10px 18px;font-family:inherit;font-si
 cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--accent),#c2185b)}
 button:disabled{opacity:.45;cursor:not-allowed}
 #stop{background:var(--panel2);border:1px solid var(--line);color:var(--dim)}
-#keybar{display:none;gap:8px;padding:10px 16px;background:var(--keybar-bg);border-bottom:1px solid var(--accent)}
-#keybar input{flex:1;background:var(--panel2);border:1px solid var(--line);color:var(--text);
-border-radius:8px;padding:8px 12px;font-family:inherit;outline:none}
-#themebtn{background:var(--panel2);border:1px solid var(--line);color:var(--text);
-width:36px;height:32px;padding:0;font-size:15px;line-height:1;border-radius:10px}
-#themebtn:hover{border-color:var(--accent)}
-a.badge{text-decoration:none}
-a.badge:hover{color:var(--accent);border-color:var(--accent)}
-@media (max-width:640px){ .msg{max-width:94%} h1{font-size:14px} }
+#guide{margin:0 16px 8px;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+font-size:12.5px;color:var(--dim)}
+#guide summary{cursor:pointer;padding:8px 14px}
+#guide div{padding:0 14px 12px;line-height:2.1}
+#guide pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;
+padding:8px 12px;overflow-x:auto;direction:ltr;text-align:left;font-size:12px}
+#toast{position:fixed;bottom:86px;right:50%;transform:translateX(50%);background:var(--accent);
+color:#fff;border-radius:20px;padding:6px 18px;font-size:13px;opacity:0;pointer-events:none;
+transition:opacity .3s;z-index:50}
+@media (max-width:820px){
+  #side{position:fixed;top:0;bottom:0;right:0;z-index:40;margin-right:-262px;box-shadow:-4px 0 18px rgba(0,0,0,.3)}
+  #side.show{margin-right:0}
+  #burger{display:block}
+  .msg{max-width:95%}
+  h1{font-size:14px}
+  #speedbadge{display:none}
+}
 </style>
 </head>
 <body>
-<header>
-  <div class="logo" title="__APP_TITLE__">R</div>
-  <h1>__APP_TITLE__</h1>
-  <span class="badge"><span class="dot" id="dot"></span><span id="modelname">…</span></span>
-  <span class="badge" id="speedbadge">سرعت: —</span>
-  <a class="badge" href="__SITE_URL__" target="_blank" rel="noopener" title="وب‌سایت کلینیک رز">وب‌سایت کلینیک ↗</a>
-  <span class="spacer"></span>
-  <span class="badge" id="clearbtn" style="cursor:pointer">پاک‌کردن گفتگو</span>
-  <button id="themebtn" title="تغییر تم شب/روز">🌙</button>
-</header>
+<div id="app">
+  <aside id="side">
+    <button id="newchat">＋ گفتگوی جدید</button>
+    <div id="chatlist"></div>
+    <div class="sidefoot">تاریخچه گفتگوها روی سرور ذخیره می‌شود و با تغییر مرورگر هم باقی می‌ماند.</div>
+  </aside>
+  <main id="main">
+    <header>
+      <button id="burger" title="لیست گفتگوها">☰</button>
+      <div class="logo" title="__APP_TITLE__">R</div>
+      <h1>__APP_TITLE__</h1>
+      <span class="badge"><span class="dot" id="dot"></span><span id="modelname">…</span></span>
+      <select id="modelsel" title="انتخاب مدل (سرعت/کیفیت)"></select>
+      <span class="badge" id="speedbadge">سرعت: —</span>
+      <a class="badge" href="__SITE_URL__" target="_blank" rel="noopener" title="وب‌سایت کلینیک رز">وب‌سایت کلینیک ↗</a>
+      <span class="spacer"></span>
+      <span class="badge" id="clearbtn" style="cursor:pointer">🧹 پاک‌کردن گفتگو</span>
+      <button id="themebtn" title="تغییر تم شب/روز">🌙</button>
+    </header>
 
-<div id="keybar">
-  <input id="keyinp" placeholder="کلید API (lr_...) — فقط وقتی چت خصوصی است لازم می‌شود">
-  <button id="keysave">ذخیره</button>
-</div>
+    <div id="keybar">
+      <input id="keyinp" placeholder="کلید API (lr_...) — فقط وقتی چت خصوصی است لازم می‌شود">
+      <button id="keysave">ذخیره</button>
+    </div>
 
-<div id="chat"><div class="msg bot" id="welcome">سلام 👋 من دستیار هوشمند کلینیک رز هستم؛ درباره خدمات، هزینه‌ها، شعبه‌ها و نوبت‌دهی آنلاین می‌توانم کمکتان کنم. بپرسید!</div></div>
+    <div id="chat"><div class="msg bot" id="welcome">سلام 👋 من دستیار هوش مصنوعی کلینیک رز هستم؛ درباره خدمات، هزینه‌ها، شعبه‌ها و نوبت‌دهی آنلاین می‌توانم کمکتان کنم.
+می‌توانید عکس، فایل Word، Excel یا PDF هم پیوست کنید، از من کد HTML بخواهید تا همین‌جا اجرا کنم، یا برای فرایندها نمودار بکشم. بپرسید!</div></div>
 
-<details id="guide">
-  <summary>راهنمای استفاده از API (برای برنامه‌های شما)</summary>
-  <div>
-    این سرور یک API سازگار با OpenAI روی همان آدرس ارائه می‌دهد. ابتدا روی سرور با اجرای
-    <b>python chat_server.py add-token --name test</b> یک توکن بسازید:
-    <pre>curl http://<span class="host"></span>/v1/chat/completions \
+    <details id="guide">
+      <summary>راهنمای امکانات و API (برای برنامه‌های شما)</summary>
+      <div>
+        <b>امکانات صفحه چت:</b> پیوست عکس/Word/Excel/PDF 📎 — اجرای کد HTML و JavaScript — نمایش نمودار فرایند (mermaid) —
+        کپی پیام‌ها و کدها — تاریخچه گفتگوها — تم شب/روز — انتخاب مدل.<br>
+        برای نمودار کافی است بخواهید: «فرایند نوبت‌دهی را به‌صورت فلوچارت بکش».<br><br>
+        این سرور یک API سازگار با OpenAI روی همان آدرس ارائه می‌دهد. ابتدا روی سرور با اجرای
+        <b>python chat_server.py add-token --name test</b> یک توکن بسازید:
+        <pre>curl http://<span class="host"></span>/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer lr_xxxxxxxx" \
   -d '{"model":"<span class="mname"></span>","messages":[{"role":"user","content":"سلام"}]}'</pre>
-    <pre>from openai import OpenAI
+        <pre>from openai import OpenAI
 client = OpenAI(base_url="http://<span class="host"></span>/v1", api_key="lr_xxxxxxxx")
 r = client.chat.completions.create(
     model="<span class="mname"></span>",
     messages=[{"role":"user","content":"سلام"}])
 print(r.choices[0].message.content)</pre>
-  </div>
-</details>
+        <b>تحلیل عکس:</b> مدل پیش‌فرض متن‌محور است؛ برای دیدن عکس‌ها روی سرور یک مدل بینایی بکشید:
+        <pre>ollama pull gemma3:4b   <span style="opacity:.6"># یا qwen2.5vl:7b</span></pre>
+        سپس از انتخاب‌مدل بالای صفحه همان را انتخاب کنید.
+      </div>
+    </details>
 
-<div id="composer">
-  <textarea id="inp" rows="1" placeholder="پیام خود را بنویسید…"></textarea>
-  <button id="stop" hidden>توقف</button>
-  <button id="send">ارسال</button>
+    <div id="attachbar"></div>
+    <div id="composer">
+      <button id="attach" title="پیوست فایل (عکس، Word، Excel، PDF، متن)">📎</button>
+      <input type="file" id="file" multiple hidden
+             accept=".png,.jpg,.jpeg,.gif,.webp,.pdf,.docx,.xlsx,.csv,.txt,.md,.log,.json,.pptx">
+      <textarea id="inp" rows="1" placeholder="پیام خود را بنویسید… (Enter = ارسال)"></textarea>
+      <button id="stop" hidden>توقف</button>
+      <button id="send">ارسال</button>
+    </div>
+  </main>
 </div>
+<div id="toast">کپی شد ✓</div>
 
 <script>
+"use strict";
 const chat = document.getElementById("chat");
 const inp = document.getElementById("inp");
 const sendBtn = document.getElementById("send");
 const stopBtn = document.getElementById("stop");
-let messages = [];
-let busy = false;
-let ctl = null;
+const welcomeEl = document.getElementById("welcome");
 
-// ---------- تم شب / روز ----------
+let messages = [];      // پیام‌های گفتگوی جاری (شکل API)
+let chats = [];         // لیست گفتگوها
+let curId = null;
+let busy = false, ctl = null;
+let pending = [];       // پیوست‌های آماده ارسال
+let pendingBusy = false;
+
+/* ---------- ابزار کوچک ---------- */
+const $ = id => document.getElementById(id);
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function toast(t){const el=$("toast");el.textContent=t;el.style.opacity=1;setTimeout(()=>el.style.opacity=0,1200);}
+function scrollDown(){chat.scrollTop=chat.scrollHeight;}
+function uid10(){let s="";for(let i=0;i<12;i++)s+="abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(Math.random()*36)];return s;}
+function faDate(iso){try{return new Date(iso).toLocaleDateString("fa-IR",{month:"short",day:"numeric"});}catch(e){return "";}}
+
+/* ---------- تم شب / روز ---------- */
 const rootEl = document.documentElement;
-const themeBtn = document.getElementById("themebtn");
-function applyTheme(t) {
+const themeBtn = $("themebtn");
+function applyTheme(t){
   rootEl.setAttribute("data-theme", t);
-  try { localStorage.setItem("lr_theme", t); } catch (e) {}
+  try{localStorage.setItem("lr_theme", t);}catch(e){}
   themeBtn.textContent = t === "light" ? "🌙" : "☀️";
-  themeBtn.title = t === "light" ? "رفتن به تم شب" : "رفتن به تم روز";
 }
 let savedTheme = null;
-try { savedTheme = localStorage.getItem("lr_theme"); } catch (e) {}
+try{ savedTheme = localStorage.getItem("lr_theme"); }catch(e){}
 applyTheme(savedTheme || ((window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches) ? "light" : "dark"));
-themeBtn.onclick = () => applyTheme(rootEl.getAttribute("data-theme") === "light" ? "dark" : "light");
+themeBtn.onclick = () => applyTheme(rootEl.getAttribute("data-theme")==="light" ? "dark" : "light");
 
-fetch("/health").then(r => r.json()).then(h => {
-  document.getElementById("modelname").textContent = h.model;
-  document.getElementById("dot").classList.add("on");
-  document.querySelectorAll(".mname").forEach(e => e.textContent = h.model);
-}).catch(() => {});
-document.querySelectorAll(".host").forEach(e => e.textContent = location.host);
+/* ---------- کلید API (چت خصوصی) ---------- */
+function authHeaders(){const k=localStorage.getItem("lr_key");return k?{"Authorization":"Bearer "+k}:{};}
+function showKeybar(v){$("keybar").style.display=v?"flex":"none";}
+$("keysave").onclick=()=>{localStorage.setItem("lr_key",$("keyinp").value.trim());showKeybar(false);};
+if(localStorage.getItem("lr_key")) $("keyinp").value=localStorage.getItem("lr_key");
 
-function authHeaders() {
-  const k = localStorage.getItem("lr_key");
-  return k ? { "Authorization": "Bearer " + k } : {};
-}
-function showKeybar(show) {
-  document.getElementById("keybar").style.display = show ? "flex" : "none";
-}
-document.getElementById("keysave").onclick = () => {
-  localStorage.setItem("lr_key", document.getElementById("keyinp").value.trim());
-  showKeybar(false);
-};
-if (localStorage.getItem("lr_key")) document.getElementById("keyinp").value = localStorage.getItem("lr_key");
+/* ---------- سلامت + لیست مدل‌ها ---------- */
+fetch("/health").then(r=>r.json()).then(h=>{
+  $("modelname").textContent=h.model;
+  $("dot").classList.add("on");
+  document.querySelectorAll(".mname").forEach(e=>e.textContent=h.model);
+}).catch(()=>{});
+document.querySelectorAll(".host").forEach(e=>e.textContent=location.host);
 
-function addBubble(cls, text) {
-  const d = document.createElement("div");
-  d.className = "msg " + cls;
-  d.textContent = text;
-  chat.appendChild(d);
-  scrollDown();
-  return d;
-}
-function scrollDown() { chat.scrollTop = chat.scrollHeight; }
-
-const welcomeEl = document.getElementById("welcome");
-document.getElementById("clearbtn").onclick = () => {
-  if (busy) return;
-  messages = []; chat.innerHTML = "";
-  if (welcomeEl) chat.appendChild(welcomeEl);
-};
-
-function setBusy(b) {
-  busy = b;
-  sendBtn.disabled = b;
-  stopBtn.hidden = !b;
-}
-
-async function send() {
-  const text = inp.value.trim();
-  if (!text || busy) return;
-  inp.value = ""; inp.style.height = "auto";
-  messages.push({ role: "user", content: text });
-  addBubble("user", text);
-  setBusy(true);
-  const bot = addBubble("bot", "در حال نوشتن…");
-  ctl = new AbortController();
-  const t0 = performance.now();
-  let ttft = null, buf = "", full = "";
-
-  try {
-    const res = await fetch("/api/chat/stream", {
-      method: "POST",
-      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
-      body: JSON.stringify({ messages: messages }),
-      signal: ctl.signal
+let chosenModel = localStorage.getItem("lr_model") || "";
+async function loadModels(){
+  try{
+    const r=await fetch("/api/models");const d=await r.json();
+    const sel=$("modelsel");sel.innerHTML="";
+    (d.models||[]).forEach(m=>{
+      const o=document.createElement("option");o.value=m;o.textContent=m;
+      if(m===(chosenModel||d.current))o.selected=true;sel.appendChild(o);
     });
-    if (res.status === 401) { showKeybar(true); bot.textContent = "این چت خصوصی است؛ کلید API را در نوار بالا وارد کنید."; bot.classList.add("errm"); throw new Error("auth"); }
-    if (res.status === 429) { bot.textContent = "تعداد درخواست‌ها زیاد است؛ کمی صبر کنید و دوباره بفرستید."; bot.classList.add("errm"); throw new Error("429"); }
-    if (!res.ok) { bot.textContent = "خطای سرور: " + res.status; bot.classList.add("errm"); throw new Error("http"); }
+    chosenModel=sel.value;
+  }catch(e){}
+}
+$("modelsel").onchange=e=>{chosenModel=e.target.value;try{localStorage.setItem("lr_model",chosenModel);}catch(x){}};
+loadModels();
 
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
+/* ---------- تاریخچه گفتگوها (سرور + مرورگر) ---------- */
+let LRUID="";
+try{
+  LRUID=localStorage.getItem("lr_uid")||"";
+  if(!/^[A-Za-z0-9_-]{8,64}$/.test(LRUID)){LRUID=uid10()+uid10()+uid10();localStorage.setItem("lr_uid",LRUID);}
+}catch(e){LRUID=uid10()+uid10()+uid10();}
+
+function slimChats(){
+  return chats.map(c=>({id:c.id,title:c.title,updated:c.updated,
+    msgs:c.msgs.map(m=>{const o={role:m.role,content:m.content};
+      if(m.att&&m.att.length)o.att=m.att.map(a=>({name:a.name,kind:a.kind,error:a.error||""}));return o;})}));
+}
+let saveTimer=null;
+function scheduleSave(){
+  clearTimeout(saveTimer);
+  saveTimer=setTimeout(()=>{
+    try{localStorage.setItem("lr_chats",JSON.stringify(slimChats()));}catch(e){}
+    fetch("/api/history",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({uid:LRUID,chats:slimChats()})}).catch(()=>{});
+  },600);
+}
+function loadHistory(){
+  // نمایش فوری از کش مرورگر
+  try{
+    const c=JSON.parse(localStorage.getItem("lr_chats")||"[]");
+    if(Array.isArray(c)&&c.length){chats=c;}
+  }catch(e){}
+  renderChatList();
+  // سپس همگام‌سازی با سرور
+  fetch("/api/history?uid="+LRUID).then(r=>r.json()).then(d=>{
+    if(Array.isArray(d.chats)&&(d.chats.length>0||chats.length===0)){chats=d.chats;renderChatList();}
+    else if(chats.length>0){scheduleSave();}
+  }).catch(()=>{});
+}
+function renderChatList(){
+  const box=$("chatlist");box.innerHTML="";
+  if(!chats.length){box.innerHTML='<div style="color:var(--dim);font-size:12px;padding:10px;text-align:center">هنوز گفتگویی ندارید</div>';return;}
+  chats.forEach(c=>{
+    const d=document.createElement("div");
+    d.className="citem"+(c.id===curId?" on":"");
+    d.innerHTML='<span class="ct">'+esc(c.title||"گفتگو")+'</span><span class="cd">'+esc(faDate(c.updated))+'</span><span class="cdel" title="حذف">🗑</span>';
+    d.onclick=()=>{if(busy)return;openChat(c.id);};
+    d.querySelector(".cdel").onclick=ev=>{
+      ev.stopPropagation();if(busy)return;
+      chats=chats.filter(x=>x.id!==c.id);
+      if(curId===c.id){curId=null;messages=[];chat.innerHTML="";chat.appendChild(welcomeEl);}
+      fetch("/api/history?uid="+LRUID+"&id="+c.id,{method:"DELETE"}).catch(()=>{});
+      scheduleSave();renderChatList();
+    };
+    box.appendChild(d);
+  });
+}
+function newChat(){
+  if(busy)return;
+  curId=null;messages=[];pending=[];
+  chat.innerHTML="";chat.appendChild(welcomeEl);
+  renderAttachBar();renderChatList();inp.focus();
+}
+function openChat(id){
+  const c=chats.find(x=>x.id===id);if(!c)return;
+  curId=id;messages=(c.msgs||[]).map(m=>Object.assign({},m));
+  chat.innerHTML="";
+  messages.forEach(m=>{
+    if(m.role==="user")addUserBubble(m);
+    else if(m.role==="assistant"){const b=addBubble("bot","");b.appendChild(renderMD(m.content));addMsgFoot(b,m.content);}
+  });
+  if(!messages.length){chat.appendChild(welcomeEl);}
+  renderChatList();scrollDown();
+}
+$("newchat").onclick=newChat;
+$("burger").onclick=()=>{$("side").classList.toggle("show");};
+$("clearbtn").onclick=()=>{
+  if(busy)return;
+  const c=chats.find(x=>x.id===curId);
+  if(c){c.msgs=[];scheduleSave();}
+  messages=[];chat.innerHTML="";chat.appendChild(welcomeEl);
+};
+
+/* ---------- حباب‌های پیام ---------- */
+function addBubble(cls,text){
+  const d=document.createElement("div");
+  d.className="msg "+cls;
+  if(text)d.textContent=text;
+  chat.appendChild(d);scrollDown();return d;
+}
+function addMsgFoot(bubble,rawText){
+  const f=document.createElement("div");f.className="msgfoot";
+  const cp=document.createElement("button");cp.className="mbtn";cp.textContent="📋 کپی";
+  cp.onclick=()=>{copyText(rawText);};
+  f.appendChild(cp);bubble.appendChild(f);
+}
+function addUserBubble(m){
+  const d=addBubble("user","");
+  let html="";
+  (m.att||[]).forEach(a=>{
+    html+='<span class="chip">'+(a.kind==="image"?"🖼":"📄")+' <span class="cn">'+esc(a.name)+"</span>"+(a.error?' ⚠️':"")+"</span>";
+  });
+  if(m.content)html+=esc(m.content).replace(/\n/g,"<br>");
+  d.innerHTML=html||"(فایل پیوست)";
+}
+function copyText(t){
+  const done=()=>toast("کپی شد ✓");
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(done).catch(()=>fallbackCopy(t,done));}
+  else fallbackCopy(t,done);
+}
+function fallbackCopy(t,done){
+  const ta=document.createElement("textarea");ta.value=t;ta.style.position="fixed";ta.style.opacity="0";
+  document.body.appendChild(ta);ta.select();
+  try{document.execCommand("copy");done();}catch(e){}
+  document.body.removeChild(ta);
+}
+
+/* ---------- هایلایت ساده کد ---------- */
+function hl(lang,code){
+  const l=(lang||"").toLowerCase();
+  let s=String(code).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  if(/^(html|xml|svg)$/.test(l)){
+    s=s.replace(/&lt;!--[\s\S]*?--&gt;/g,m=>'<span class="tok-com">'+m+'</span>');
+    s=s.replace(/&lt;(\/?)([a-zA-Z][\w:-]*)((?:[^&]|&(?!gt;))*?)(\/?)&gt;/g,
+      (m,sl,tn,attrs,slv)=>'<span class="tok-tag">&lt;'+sl+tn+'</span>'+
+        attrs.replace(/([a-zA-Z-]+)=("[^"]*")/g,'<span class="tok-attr">$1</span>=$2')+
+        '<span class="tok-tag">'+slv+'&gt;</span>');
+    return s;
+  }
+  const kwMap={
+    js:"const let var function return if else for while class new import from export try catch finally async await throw typeof of in break continue switch case default null undefined true false this document window console",
+    javascript:"const let var function return if else for while class new import from export try catch finally async await throw typeof of in break continue switch case default null undefined true false this document window console",
+    py:"def return if elif else for while import from class try except finally with as pass raise lambda None True False and or not in is print self range len str int float dict list",
+    python:"def return if elif else for while import from class try except finally with as pass raise lambda None True False and or not in is print self range len str int float dict list",
+    sql:"select from where insert update delete join left right on as and or not null group by order limit"};
+  const kw=kwMap[l]||"";
+  const hashCom=/^(py|python|sh|bash|yaml|yml|rb|ruby)$/.test(l)?'|#[^\\n]*':'';
+  const kwPart=kw?('\\b(?:'+kw.split(" ").join("|")+')\\b'):'\\b\\B';
+  const re=new RegExp(
+    '(\\/\\*[\\s\\S]*?\\*\\/|\\/\\/[^\\n]*'+hashCom+')'+
+    '|("(?:[^"\\\\\\n]|\\\\.)*"|\'(?:[^\'\\\\\\n]|\\\\.)*\'|`(?:[^`\\\\]|\\\\.)*`)'+
+    '|('+kwPart+')'+
+    '|\\b(\\d+(?:\\.\\d+)?)\\b','g');
+  s=s.replace(re,(m,c,st,k2)=>{
+    if(c!==undefined)return '<span class="tok-com">'+m+'</span>';
+    if(st!==undefined)return '<span class="tok-str">'+m+'</span>';
+    if(k2!==undefined)return '<span class="tok-kw">'+m+'</span>';
+    return '<span class="tok-num">'+m+'</span>';
+  });
+  return s;
+}
+
+/* ---------- اجرای کد ---------- */
+const _jsRuns=[];
+window.addEventListener("message",e=>{
+  if(e.data&&e.data.__lr){
+    const run=_jsRuns.find(r=>r.el.contentWindow===e.source);
+    if(run){const l=document.createElement("div");
+      if(e.data.kind==="error")l.className="je";else if(e.data.kind==="warn")l.className="jw";
+      l.textContent=e.data.text;run.out.appendChild(l);}
+  }
+});
+function runHtml(code,out){
+  out.innerHTML="";
+  const f=document.createElement("iframe");
+  f.setAttribute("sandbox","allow-scripts allow-forms allow-modals allow-popups");
+  f.srcdoc=code;out.appendChild(f);
+}
+function runJs(code,out){
+  out.innerHTML="";
+  const log=document.createElement("div");log.className="jout";
+  log.innerHTML='<div style="opacity:.6">خروجی کنسول:</div>';out.appendChild(log);
+  const f=document.createElement("iframe");
+  f.setAttribute("sandbox","allow-scripts");
+  f.style.display="none";
+  const safe=code.replace(/<\/script/gi,"<\\/script");
+  f.srcdoc='<!doctype html><html><head><meta charset="utf-8"></head><body><script>\n'+
+    'const send=(k,t)=>{try{parent.postMessage({__lr:1,kind:k,text:t},"*")}catch(e){}};\n'+
+    '["log","info","warn","error"].forEach(k=>{console[k]=(...a)=>{send(k,a.map(x=>{try{return typeof x==="object"?JSON.stringify(x):String(x)}catch(e){return String(x)}}).join(" "))};});\n'+
+    'window.onerror=(m,s,l)=>send("error",m+" (خط "+l+")");\n'+
+    "<\/script><script>"+safe+"\n<\/script></body></html>";
+  out.appendChild(f);
+  _jsRuns.push({el:f,out:log});
+}
+/* ---------- رندر نمودار (زیرمجموعه mermaid: flowchart TD/LR) ---------- */
+let _flowN=0;
+function renderFlow(src){
+  const lines=src.split(/\r?\n/).map(l=>l.trim()).filter(l=>l&&!l.startsWith("%%"));
+  let dir="TD",body=lines;
+  const head=lines.length?lines[0].match(/^(?:flowchart|graph)\s+(TD|TB|LR|RL)/i):null;
+  if(head){dir=head[1].toUpperCase();body=lines.slice(1);}
+  if(dir==="TB")dir="TD";
+  if(dir==="RL")dir="LR";
+  const isTD=dir==="TD";
+  const nodes={},edges=[],order=[];
+  function parseNode(raw){
+    raw=raw.trim().replace(/^["\u201c](.*)["\u201d]$/,"$1");
+    const m=raw.match(/^([\w\u0600-\u06FF]+)\s*(.*)$/);
+    if(!m)return null;
+    const id=m[1];let rest=m[2].trim(),shape="rect",label=id;
+    if(rest.length>1){
+      const a=rest[0],b=rest[rest.length-1];let inner=rest.slice(1,-1).trim();
+      if(a==="["&&b==="]")shape="rect";
+      else if(a==="("&&b===")")shape=(inner.startsWith("(")&&inner.endsWith(")"))?"circle":"round";
+      else if(a==="{"&&b==="}")shape="diamond";
+      if(inner)label=inner.replace(/^["\u201c](.*)["\u201d]$/,"$1");
+    }
+    if(!nodes[id]){nodes[id]={id,label,shape};order.push(id);}
+    else if(label!==id)nodes[id].label=label;
+    return nodes[id];
+  }
+  const ere=/(-\.->|==>|-->|---)\s*(?:\|([^|]*)\|)?\s*/;
+  for(const line of body){
+    let rest=line,parts=[],labels=[],ops=[];
+    let m,last=0;
+    while((m=rest.slice(last).match(ere))){
+      const at=last+m.index;
+      parts.push(rest.slice(0,at).trim());
+      labels.push(m[2]||"");ops.push(m[1]);
+      rest=rest.slice(at+m[0].length);last=0;
+    }
+    parts.push(rest.trim());
+    const nds=parts.map(parseNode);
+    for(let i=0;i<nds.length-1;i++)
+      if(nds[i]&&nds[i+1])edges.push({from:nds[i].id,to:nds[i+1].id,label:labels[i]||"",dash:ops[i]==="-.->"});
+  }
+  if(!order.length)throw new Error("گرهی پیدا نشد");
+  // عمق هر گره = بلندترین مسیر از ریشه‌ها
+  const depth={},adj={};
+  edges.forEach(e=>{(adj[e.from]=adj[e.from]||[]).push(e.to);});
+  function dfs(id,d){const cur=(depth[id]===undefined?-(1e9):depth[id]);if(cur>=d)return;depth[id]=d;(adj[id]||[]).forEach(t=>dfs(t,d+1));}
+  order.forEach(id=>{if(!edges.some(e=>e.to===id))dfs(id,0);});
+  order.forEach(id=>{if(depth[id]===undefined)dfs(id,0);});
+  const rows=[];
+  order.forEach(id=>{const d=depth[id]||0;(rows[d]=rows[d]||[]).push(id);});
+  function nsize(n){
+    const parts=String(n.label).split(/\s*\|\s*|\n/);
+    const w=Math.max(84,Math.min(230,Math.max(...parts.map(x=>x.length))*8.4+34));
+    const h=(n.shape==="diamond"?62:42)+(parts.length-1)*17;
+    return{w:w,h:h};
+  }
+  const pos={},size={};
+  rows.forEach(row=>row.forEach(id=>{size[id]=nsize(nodes[id]);}));
+  // چیدمان لایه‌ای
+  const layerMax=rows.map(row=>Math.max(...row.map(id=>isTD?size[id].h:size[id].w)));
+  const off=[];let acc=16;
+  for(let r=0;r<rows.length;r++){off[r]=acc;acc+=layerMax[r]+(isTD?76:118);}
+  rows.forEach((row,r)=>{
+    let cur=16;
+    row.forEach(id=>{
+      const s=size[id];
+      pos[id]=isTD?{x:cur+s.w/2,y:off[r]+s.h/2}:{x:off[r]+s.w/2,y:cur+s.h/2};
+      cur+=(isTD?s.w:s.h)+46;
+    });
+  });
+  const cross=rows.map(row=>Math.max(...row.map(id=>isTD?size[id].w:size[id].h)));
+  const W=(isTD?Math.max(...cross,140):Math.max(acc-118,140))+16;
+  const H=(isTD?Math.max(acc-76,140):Math.max(...cross,140))+16;
+  function geo(id){const p=pos[id],s=size[id];return{cx:p.x,cy:p.y,x:p.x-s.w/2,y:p.y-s.h/2,w:s.w,h:s.h};}
+  const mid="arw"+(++_flowN);
+  let sh="";
+  edges.forEach(e=>{
+    const a=geo(e.from),b=geo(e.to);
+    let x1,y1,x2,y2;
+    if(isTD){x1=a.cx;y1=a.y+a.h;x2=b.cx;y2=b.y;}
+    else{x1=a.x+a.w;y1=a.cy;x2=b.x;y2=b.cy;}
+    const mx=(x1+x2)/2,my=(y1+y2)/2;
+    sh+='<line x1="'+x1.toFixed(1)+'" y1="'+y1.toFixed(1)+'" x2="'+x2.toFixed(1)+'" y2="'+y2.toFixed(1)+'" stroke="var(--dim)" stroke-width="1.6"'+(e.dash?' stroke-dasharray="6 4"':"")+' marker-end="url(#'+mid+')"/>';
+    if(e.label)sh+='<text x="'+mx.toFixed(1)+'" y="'+(my-6).toFixed(1)+'" font-size="11.5" fill="var(--dim)" text-anchor="middle" style="direction:rtl">'+esc(e.label)+"</text>";
+  });
+  order.forEach(id=>{
+    const c=geo(id),n=nodes[id];
+    let shapeEl="";
+    if(n.shape==="diamond")
+      shapeEl='<polygon points="'+c.x+","+(c.y+c.h/2)+" "+(c.x+c.w/2)+","+c.y+" "+(c.x+c.w)+","+(c.y+c.h/2)+" "+(c.x+c.w/2)+","+(c.y+c.h)+'" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.5"/>';
+    else if(n.shape==="circle")
+      shapeEl='<ellipse cx="'+(c.x+c.w/2)+'" cy="'+(c.y+c.h/2)+'" rx="'+(Math.max(c.w,c.h)/2)+'" ry="'+(Math.max(c.w,c.h)/2)+'" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.5"/>';
+    else
+      shapeEl='<rect x="'+c.x+'" y="'+c.y+'" width="'+c.w+'" height="'+c.h+'" rx="'+(n.shape==="round"?18:8)+'" fill="var(--panel)" stroke="var(--accent)" stroke-width="1.5"/>';
+    sh+=shapeEl;
+    const parts=String(n.label).split(/\s*\|\s*|\n/);
+    const lh=17,y0=c.cy-(parts.length-1)*lh/2+4.5;
+    parts.forEach((ln,i)=>{sh+='<text x="'+c.cx.toFixed(1)+'" y="'+(y0+i*lh).toFixed(1)+'" font-size="12.5" fill="var(--text)" text-anchor="middle" style="direction:rtl">'+esc(ln)+"</text>";});
+  });
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 '+W.toFixed(0)+" "+H.toFixed(0)+'" style="max-width:100%">'+
+    '<defs><marker id="'+mid+'" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">'+
+    '<path d="M0,0 L10,5 L0,10 z" fill="var(--dim)"/></marker></defs>'+sh+"</svg>";
+}
+
+/* ---------- بلوک کد تعاملی ---------- */
+function makeCodeBlock(lang,code){
+  const box=document.createElement("div");box.className="codebox";
+  const head=document.createElement("div");head.className="codehead";
+  head.innerHTML='<span class="lang">'+esc(lang||"code")+"</span>";
+  const pre=document.createElement("pre");
+  const cd=document.createElement("code");
+  cd.innerHTML=hl(lang,code);pre.appendChild(cd);
+  const out=document.createElement("div");out.className="codeout";out.style.display="none";
+  const cp=document.createElement("button");cp.className="codebtn";cp.textContent="کپی";
+  cp.onclick=()=>copyText(code);
+  head.appendChild(cp);
+  const l=(lang||"").toLowerCase();
+  let shown=false;
+  function toggleOut(builder,label){
+    const btn=document.createElement("button");btn.className="codebtn";btn.textContent=label;
+    btn.onclick=()=>{
+      shown=!shown;
+      out.style.display=shown?"block":"none";
+      if(shown&&!out.childNodes.length)builder();
+      btn.textContent=shown?(l==="js"?"بستن خروجی":"بستن پیش‌نمایش"):label;
+    };
+    head.appendChild(btn);return btn;
+  }
+  if(l==="html"||l==="svg")toggleOut(()=>runHtml(code,out),"اجرا ▶");
+  else if(l==="js"||l==="javascript")toggleOut(()=>runJs(code,out),"اجرا ▶");
+  else if(l==="mermaid"||l==="flowchart"||l==="diagram"||l==="graph"){
+    let built=false,codeShown=false;
+    function buildDiagram(){
+      out.innerHTML="";
+      const dv=document.createElement("div");dv.className="diagram";
+      try{dv.innerHTML=renderFlow(code);}
+      catch(err){dv.innerHTML='<div style="color:var(--err);font-size:12px">رندر نمودار ممکن نشد: '+esc(err.message)+"</div>";}
+      out.appendChild(dv);
+    }
+    const btn=document.createElement("button");btn.className="codebtn";btn.textContent="نمایش کد";
+    btn.onclick=()=>{
+      codeShown=!codeShown;
+      pre.style.display=codeShown?"block":"none";
+      out.style.display=codeShown?"none":"block";
+      if(!codeShown&&!built){buildDiagram();built=true;}
+      btn.textContent=codeShown?"نمایش نمودار":"نمایش کد";
+    };
+    head.appendChild(btn);
+    pre.style.display="none";
+    out.style.display="block";
+    requestAnimationFrame(()=>{if(!built){buildDiagram();built=true;}});
+  }
+  box.appendChild(head);box.appendChild(pre);box.appendChild(out);
+  return box;
+}
+
+/* ---------- رندر مارک‌داون سبک ---------- */
+function renderMD(text){
+  const codes=[];
+  let t=String(text).replace(/```([\w+-]*)\r?\n?([\s\S]*?)(?:```|$)/g,(m,lang,code)=>{
+    codes.push({lang:(lang||"").toLowerCase(),code:code.replace(/\n$/,"")});
+    return "\uE000"+(codes.length-1)+"\uE001";
+  });
+  t=esc(t);
+  t=t.replace(/\*\*([^*\n]+)\*\*/g,"<b>$1</b>");
+  t=t.replace(/`([^`\n]+)`/g,'<code class="ic">$1</code>');
+  t=t.replace(/(https?:\/\/[^\s<\uE000-\uE001]+)/g,'<a href="$1" target="_blank" rel="noopener">$1</a>');
+  const lines=t.split("\n");
+  let html="",listType=null,listBuf=[];
+  const flushList=()=>{
+    if(listType&&listBuf.length){
+      html+="<"+listType+">"+listBuf.map(x=>"<li>"+x+"</li>").join("")+"</"+listType+">";
+    }
+    listType=null;listBuf=[];
+  };
+  for(const raw of lines){
+    const line=raw;
+    const lm=line.match(/^\s*(?:[-*•]|\d+[.)])\s+(.*)$/);
+    if(lm){
+      const isOl=/^\s*\d/.test(line);
+      if(listType&&listType!==(isOl?"ol":"ul"))flushList();
+      listType=isOl?"ol":"ul";listBuf.push(lm[1]);continue;
+    }
+    flushList();
+    if(/^\s*$/.test(line)){continue;}
+    let hm;
+    if((hm=line.match(/^(#{1,4})\s+(.*)$/))){html+="<h5>"+hm[2]+"</h5>";continue;}
+    if(/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)){html+="<hr>";continue;}
+    if((hm=line.match(/^&gt;\s?(.*)$/))){html+="<blockquote>"+hm[1]+"</blockquote>";continue;}
+    html+='<p>'+line+"</p>";
+  }
+  flushList();
+  html=html.replace(/\uE000(\d+)\uE001/g,(m,i)=>'<div data-code="'+i+'"></div>');
+  const wrap=document.createElement("div");
+  wrap.innerHTML=html;
+  wrap.querySelectorAll("div[data-code]").forEach(el=>{
+    const c=codes[+el.getAttribute("data-code")];
+    if(c)el.replaceWith(makeCodeBlock(c.lang,c.code));
+  });
+  return wrap;
+}
+
+/* ---------- پیوست فایل ---------- */
+const MAXF=8*1024*1024;
+function renderAttachBar(){
+  const bar=$("attachbar");
+  if(!pending.length){bar.style.display="none";bar.innerHTML="";return;}
+  bar.style.display="flex";bar.innerHTML="";
+  pending.forEach((p,i)=>{
+    const c=document.createElement("span");
+    c.className="chip"+(p.error?" cker":"");
+    c.innerHTML=(p.kind==="image"?"🖼":p.busy?"⏳":"📄")+' <span class="cn">'+esc(p.name)+"</span>"+(p.error?' <b style="color:var(--err)">⚠</b>':"")+' <span class="cx" title="حذف">✕</span>';
+    c.querySelector(".cx").onclick=()=>{pending.splice(i,1);renderAttachBar();};
+    bar.appendChild(c);
+  });
+}
+function fileToB64(file){
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=()=>res(String(r.result).split(",")[1]||"");
+    r.onerror=rej;r.readAsDataURL(file);
+  });
+}
+function shrinkImage(b64,mime){
+  return new Promise(res=>{
+    const img=new Image();
+    img.onload=()=>{
+      const mx=1024;let w=img.width,h=img.height;
+      if(w>mx||h>mx){const k=Math.min(mx/w,mx/h);w=Math.round(w*k);h=Math.round(h*k);}
+      const cv=document.createElement("canvas");cv.width=w;cv.height=h;
+      cv.getContext("2d").drawImage(img,0,0,w,h);
+      res(cv.toDataURL("image/jpeg",0.85).split(",")[1]);
+    };
+    img.onerror=()=>res(b64);
+    img.src="data:"+mime+";base64,"+b64;
+  });
+}
+async function addFiles(files){
+  for(const f of files){
+    if(f.size>MAXF){pending.push({name:f.name,kind:"file",error:"حجم بیش از ۸ مگابایت"});renderAttachBar();continue;}
+    const item={name:f.name,kind:"file",busy:true};
+    pending.push(item);renderAttachBar();
+    try{
+      const b64=await fileToB64(f);
+      const ext=(f.name.split(".").pop()||"").toLowerCase();
+      if(/^(png|jpg|jpeg|gif|webp|bmp)$/.test(ext)){
+        const sb=await shrinkImage(b64,"image/"+(ext==="jpg"?"jpeg":ext));
+        item.kind="image";item.b64=sb;item.busy=false;
+      }else{
+        const r=await fetch("/api/extract",{method:"POST",headers:{"Content-Type":"application/json"},
+          body:JSON.stringify({name:f.name,b64:b64})});
+        const d=await r.json();
+        item.kind=d.kind||"file";item.busy=false;
+        if(d.error)item.error=d.error;
+        if(d.text)item.text=d.text;
+      }
+    }catch(e){item.busy=false;item.error="خواندن فایل ناموفق بود";}
+    renderAttachBar();
+  }
+}
+$("attach").onclick=()=>$("file").click();
+$("file").onchange=e=>{addFiles([...e.target.files]);e.target.value="";};
+
+/* ---------- ارسال ---------- */
+function setBusy(b){busy=b;sendBtn.disabled=b||pendingBusy;stopBtn.hidden=!b;}
+async function send(){
+  const text=inp.value.trim();
+  if(busy||pendingBusy)return;
+  if(!text&&!pending.length)return;
+  inp.value="";inp.style.height="auto";
+  // ساخت پیام کاربر
+  const msg={role:"user",content:text,att:[]};
+  const imgs=[],atts=[];
+  pending.forEach(p=>{
+    if(p.kind==="image"&&p.b64){imgs.push(p.b64);msg.att.push({name:p.name,kind:"image"});}
+    else{atts.push({name:p.name,kind:p.kind,text:p.text||"",error:p.error||""});
+         msg.att.push({name:p.name,kind:p.kind,error:p.error||""});}
+  });
+  if(atts.length)msg.attachments=atts;
+  if(imgs.length)msg.images=imgs;
+  pending=[];renderAttachBar();
+  messages.push(msg);
+  // ثبت در تاریخچه
+  if(!curId){
+    curId=uid10()+uid10();
+    chats.unshift({id:curId,title:(text||msg.att[0].name||"گفتگو").slice(0,48),updated:new Date().toISOString(),msgs:[]});
+  }
+  const cur=chats.find(c=>c.id===curId);
+  if(cur){cur.updated=new Date().toISOString();cur.msgs=messages.map(m=>{const o={role:m.role,content:m.content};if(m.att)o.att=m.att;return o;});}
+  renderChatList();
+  addUserBubble(msg);
+  setBusy(true);
+  const bot=addBubble("bot","در حال نوشتن…");
+  ctl=new AbortController();
+  const t0=performance.now();
+  let ttft=null,buf="",full="";
+  try{
+    const res=await fetch("/api/chat/stream",{
+      method:"POST",
+      headers:Object.assign({"Content-Type":"application/json"},authHeaders()),
+      body:JSON.stringify({messages:messages,model:chosenModel||undefined}),
+      signal:ctl.signal
+    });
+    if(res.status===401){showKeybar(true);bot.textContent="این چت خصوصی است؛ کلید API را در نوار بالا وارد کنید.";bot.classList.add("errm");throw new Error("auth");}
+    if(res.status===429){bot.textContent="تعداد درخواست‌ها زیاد است؛ کمی صبر کنید و دوباره بفرستید.";bot.classList.add("errm");throw new Error("429");}
+    if(!res.ok){bot.textContent="خطای سرور: "+res.status;bot.classList.add("errm");throw new Error("http");}
+    const reader=res.body.getReader();
+    const dec=new TextDecoder();
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buf+=dec.decode(value,{stream:true});
       let idx;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
-        const line = block.split("\n").find(l => l.startsWith("data: "));
-        if (!line) continue;
-        let obj; try { obj = JSON.parse(line.slice(6)); } catch (e) { continue; }
-        if (obj.error) { bot.textContent = (full ? full + "\n" : "") + "خطا: " + obj.error; bot.classList.add("errm"); }
-        if (obj.content) {
-          if (ttft === null) { ttft = performance.now() - t0; bot.textContent = ""; }
-          full += obj.content;
-          bot.textContent = full;
+      while((idx=buf.indexOf("\n\n"))>=0){
+        const block=buf.slice(0,idx);buf=buf.slice(idx+2);
+        const line=block.split("\n").find(l=>l.startsWith("data: "));
+        if(!line)continue;
+        let obj;try{obj=JSON.parse(line.slice(6));}catch(e){continue;}
+        if(obj.error){bot.textContent=(full?full+"\n":"")+"خطا: "+obj.error;bot.classList.add("errm");}
+        if(obj.content){
+          if(ttft===null){ttft=performance.now()-t0;bot.textContent="";}
+          full+=obj.content;
+          bot.textContent=full;
           scrollDown();
         }
-        if (obj.done && obj.stats) {
-          const chip = document.createElement("div");
-          chip.className = "stats";
-          chip.textContent = obj.stats.tps + " توکن/ثانیه — " + obj.stats.tokens + " توکن — شروع پاسخ: " + obj.stats.ttft + " ثانیه";
+        if(obj.done&&obj.stats){
+          const chip=document.createElement("div");
+          chip.className="stats";
+          chip.textContent=obj.stats.tps+" توکن/ثانیه — "+obj.stats.tokens+" توکن — شروع پاسخ: "+obj.stats.ttft+" ثانیه";
           chat.appendChild(chip);
-          document.getElementById("speedbadge").textContent = "سرعت: " + obj.stats.tps + " tok/s";
+          $("speedbadge").textContent="سرعت: "+obj.stats.tps+" tok/s";
           scrollDown();
         }
       }
     }
-    if (full) messages.push({ role: "assistant", content: full });
-  } catch (e) {
-    if (e.name !== "AbortError" && !full) {
-      bot.textContent = "خطا در ارتباط با سرور. سرویس مدل را بررسی کنید.";
+    if(full){
+      messages.push({role:"assistant",content:full});
+      if(cur){cur.msgs=messages.map(m=>{const o={role:m.role,content:m.content};if(m.att)o.att=m.att;return o;});}
+      // رندر نهایی مارک‌داون + دکمه‌ها
+      bot.classList.remove("errm");
+      bot.innerHTML="";bot.appendChild(renderMD(full));
+      addMsgFoot(bot,full);
+      scheduleSave();
+    }
+  }catch(e){
+    if(e.name!=="AbortError"&&!full){
+      bot.textContent="خطا در ارتباط با سرور. سرویس مدل را بررسی کنید.";
       bot.classList.add("errm");
     }
+    if(full){try{bot.innerHTML="";bot.appendChild(renderMD(full));addMsgFoot(bot,full);}catch(e){bot.textContent=full;}if(cur){cur.msgs=messages.map(m=>{const o={role:m.role,content:m.content};if(m.att)o.att=m.att;return o;});scheduleSave();}}
   }
   setBusy(false);
+  if(pendingBusy)sendBtn.disabled=true;
   scrollDown();
 }
+sendBtn.onclick=send;
+stopBtn.onclick=()=>{if(ctl)ctl.abort();setBusy(false);};
+inp.addEventListener("keydown",e=>{
+  if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();send();}
+});
+inp.addEventListener("input",()=>{
+  inp.style.height="auto";
+  inp.style.height=Math.min(inp.scrollHeight,140)+"px";
+});
+$("send").disabled=false;
 
-sendBtn.onclick = send;
-stopBtn.onclick = () => { if (ctl) ctl.abort(); setBusy(false); };
-inp.addEventListener("keydown", e => {
-  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
-});
-inp.addEventListener("input", () => {
-  inp.style.height = "auto";
-  inp.style.height = Math.min(inp.scrollHeight, 140) + "px";
-});
+/* ---------- شروع ---------- */
+loadHistory();
 </script>
 </body>
 </html>
 """
 
 
+
+
+
+
 # =====================================================================
 # هندلر HTTP
 # =====================================================================
-def build_handler(settings, store, limiter, boot_ts):
-    MAX_BODY = 262144  # 256KB
+def build_handler(settings, store, limiter, boot_ts, hist):
+    MAX_BODY = 12 * 1024 * 1024  # 12MB (برای پیوست فایل)
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -626,7 +1431,26 @@ def build_handler(settings, store, limiter, boot_ts):
                 role = m.get("role")
                 content = m.get("content")
                 if role in ("system", "user", "assistant") and isinstance(content, str):
-                    clean.append({"role": role, "content": content[:max_chars]})
+                    out = {"role": role, "content": content[:max_chars]}
+                    if role == "user":
+                        # عکس‌ها برای مدل‌های بینایی به Ollama پاس داده می‌شوند
+                        imgs = m.get("images")
+                        if isinstance(imgs, list):
+                            ok = [i for i in imgs[:4]
+                                  if isinstance(i, str) and 0 < len(i) <= 9_000_000]
+                            if ok:
+                                out["images"] = ok
+                        # متن استخراج‌شدهٔ پیوست‌ها به محتوای پیام افزوده می‌شود
+                        atts = m.get("attachments")
+                        if isinstance(atts, list) and atts:
+                            folded = []
+                            for a in atts[:6]:
+                                if isinstance(a, dict) and a.get("name"):
+                                    folded.append("«فایل پیوست: " + str(a["name"])[:80] + "»\n"
+                                                  + str(a.get("text") or "")[:6000])
+                            if folded:
+                                out["content"] = out["content"] + "\n\n" + "\n\n".join(folded)
+                    clean.append(out)
             return clean
 
         @staticmethod
@@ -718,6 +1542,14 @@ def build_handler(settings, store, limiter, boot_ts):
                                                       "type": "auth_error"}})
                 self._json(200, {"object": "list", "data": [
                     {"id": settings.model, "object": "model", "owned_by": "llm-rose"}]})
+            elif path == "/api/models":
+                self._json(200, {"models": list_models(settings), "current": settings.model})
+            elif path == "/api/history":
+                qs = parse_qs(urlparse(self.path).query)
+                uid = (qs.get("uid") or [""])[0]
+                if not HistoryStore.safe_uid(uid):
+                    return self._json(400, {"error": "شناسه نامعتبر است"})
+                self._json(200, {"chats": hist.load(uid)})
             else:
                 self._json(404, {"error": "یافت نشد"})
 
@@ -744,6 +1576,10 @@ def build_handler(settings, store, limiter, boot_ts):
                     self.handle_admin_create(body)
                 elif path == "/admin/tokens/revoke":
                     self.handle_admin_revoke(body)
+                elif path == "/api/extract":
+                    self.handle_extract(body)
+                elif path == "/api/history":
+                    self.handle_history_save(body)
                 else:
                     self._json(404, {"error": "یافت نشد"})
             except (BrokenPipeError, ConnectionResetError):
@@ -753,6 +1589,55 @@ def build_handler(settings, store, limiter, boot_ts):
                     self._json(500, {"error": f"خطای داخلی: {exc}"})
                 except Exception:
                     self.close_connection = True
+
+        # ---------- DELETE (حذف تاریخچه) ----------
+        def do_DELETE(self):
+            path = self.path.split("?")[0]
+            if path == "/api/history":
+                qs = parse_qs(urlparse(self.path).query)
+                uid = (qs.get("uid") or [""])[0]
+                if not HistoryStore.safe_uid(uid):
+                    return self._json(400, {"error": "شناسه نامعتبر است"})
+                hist.delete(uid, (qs.get("id") or [None])[0])
+                return self._json(200, {"ok": True})
+            self._json(404, {"error": "یافت نشد"})
+
+        # ---------- استخراج متن پیوست ----------
+        def handle_extract(self, body):
+            name = str(body.get("name") or "file")
+            b64 = body.get("b64") or ""
+            if not isinstance(b64, str) or not b64:
+                return self._json(400, {"error": "فایلی دریافت نشد"})
+            if len(b64) > 11_000_000:
+                return self._json(413, {"error": "حجم فایل بیش از حد مجاز است (حداکثر ۸ مگابایت)"})
+            try:
+                data = base64.b64decode(b64)
+            except Exception:
+                return self._json(400, {"error": "فایل قابل خواندن نبود"})
+            text, kind = extract_text_from(name, data)
+            res = {"name": name[:120], "kind": kind, "chars": len(text)}
+            if kind == "image":
+                res["image_ok"] = True
+            elif kind == "doc-legacy":
+                res["error"] = "قالب doc قدیمی پشتیبانی نمی‌شود؛ فایل را با پسوند docx ذخیره و دوباره پیوست کنید."
+            elif kind == "binary":
+                res["error"] = "از این نوع فایل نمی‌توان متن استخراج کرد."
+            elif not text.strip():
+                res["error"] = "متنی در فایل پیدا نشد (اگر PDF اسکن‌شده است، متن ندارد)."
+            else:
+                res["text"] = text
+            self._json(200, res)
+
+        # ---------- ذخیره تاریخچه ----------
+        def handle_history_save(self, body):
+            uid = body.get("uid")
+            if not HistoryStore.safe_uid(uid):
+                return self._json(400, {"error": "شناسه نامعتبر است"})
+            try:
+                hist.save(uid, body.get("chats") or [])
+            except Exception as exc:
+                return self._json(400, {"error": f"ذخیره ناموفق: {exc}"})
+            self._json(200, {"ok": True})
 
         # ---------- چت وب (استریم SSE) ----------
         def handle_web_chat(self, body):
@@ -773,6 +1658,9 @@ def build_handler(settings, store, limiter, boot_ts):
             msgs = self._clean_messages(body.get("messages") or [])
             if not msgs:
                 return self._json(400, {"error": "پیامی ارسال نشده است"})
+            model = body.get("model")
+            if not (isinstance(model, str) and MODEL_RE.fullmatch(model)):
+                model = None
             if not any(m["role"] == "system" for m in msgs):
                 msgs = [{"role": "system", "content": self._effective_system(msgs)}] + msgs
             else:
@@ -782,7 +1670,7 @@ def build_handler(settings, store, limiter, boot_ts):
             ttft, full, last_stats = None, "", {}
             t0 = time.perf_counter()
             try:
-                for obj in ollama_chat_stream(settings, msgs, settings.max_output_tokens):
+                for obj in ollama_chat_stream(settings, msgs, settings.max_output_tokens, model=model):
                     if obj.get("done"):
                         last_stats = obj
                         break
@@ -845,13 +1733,16 @@ def build_handler(settings, store, limiter, boot_ts):
             cid = "chatcmpl-" + secrets.token_hex(6)
             created = int(time.time())
             model_name = body.get("model") or settings.model
+            model_use = (model_name if isinstance(model_name, str) and MODEL_RE.fullmatch(model_name)
+                         else settings.model)
+            model_name = model_use
             t0 = time.perf_counter()
             ttft, full, last_stats = None, "", {}
 
             if stream:
                 self._sse_headers()
                 try:
-                    for obj in ollama_chat_stream(settings, msgs, num_predict):
+                    for obj in ollama_chat_stream(settings, msgs, num_predict, model=model_use):
                         if obj.get("done"):
                             last_stats = obj
                             break
@@ -884,7 +1775,7 @@ def build_handler(settings, store, limiter, boot_ts):
                 self.close_connection = True
             else:
                 try:
-                    for obj in ollama_chat_stream(settings, msgs, num_predict):
+                    for obj in ollama_chat_stream(settings, msgs, num_predict, model=model_use):
                         if obj.get("done"):
                             last_stats = obj
                             break
@@ -1003,8 +1894,9 @@ def local_ips():
 def run_server(settings):
     store = TokenStore(settings.data_dir / "tokens.json")
     limiter = RateLimiter()
+    hist = HistoryStore(settings.data_dir)
     boot_ts = time.time()
-    handler = build_handler(settings, store, limiter, boot_ts)
+    handler = build_handler(settings, store, limiter, boot_ts, hist)
 
     print("=" * 64)
     print("  LLM Rose — سرور چت وب و API فارسی")
