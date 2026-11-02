@@ -20,7 +20,7 @@
 param(
     [ValidateSet("run", "install", "restart", "diagnose", "remove", "status")][string]$Action = "run",
     [int]$Port = 8093,
-    [string]$Model = "qwen3:8b",
+    [string]$Model = "qwen3:4b",   # مدل سبک و سریع برای CPU (برای کیفیت بالاتر: -Model qwen3:8b)
     [string]$VisionModel = "",
     [switch]$SetOllamaEnv
 )
@@ -30,6 +30,25 @@ $dir = $PSScriptRoot
 $python = (Get-Command python -ErrorAction SilentlyContinue).Source
 if (-not $python) { $python = (Get-Command py -ErrorAction Stop).Source }
 $taskName = "LLMRoseChat"
+
+# اگر مدل روی Ollama موجود نباشد، یک‌بار دانلود می‌شود (اگر Ollama در دسترس باشد)
+function Ensure-Model([string]$m) {
+    if (-not $m) { return }
+    $names = @()
+    try {
+        $tags = Invoke-RestMethod "http://127.0.0.1:11434/api/tags" -TimeoutSec 5
+        if ($tags.models) { $names = @($tags.models | ForEach-Object { $_.name }) }
+    } catch {
+        Write-Host "Ollama در دسترس نیست؛ بررسی وجود مدل '$m' رد شد (اگر مدل را ندارید: ollama pull $m)" -ForegroundColor Yellow
+        return
+    }
+    if ($names -notcontains $m -and $names -notcontains "${m}:latest") {
+        Write-Host "مدل '$m' روی Ollama نیست؛ دانلود می‌شود (فقط بار اول، ممکن است چند دقیقه طول بکشد)..." -ForegroundColor Yellow
+        & ollama pull $m
+    } else {
+        Write-Host "مدل '$m' از قبل موجود است ✓"
+    }
+}
 
 if ($SetOllamaEnv) {
     Write-Host "تنظیم متغیرهای بهینه Ollama (KEEP_ALIVE / FLASH_ATTENTION / KV_CACHE)..." -ForegroundColor Cyan
@@ -56,7 +75,11 @@ switch ($Action) {
         }
         else { Write-Host "قانون فایروال از قبل موجود است." }
 
-        Write-Host "=== ۲) ثبت سرویس (Scheduled Task با حساب SYSTEM) ===" -ForegroundColor Cyan
+        Write-Host "=== ۲) بررسی/دانلود مدل‌ها (چت + بینایی) ===" -ForegroundColor Cyan
+        Ensure-Model $Model
+        if ($VisionModel) { Ensure-Model $VisionModel }
+
+        Write-Host "=== ۳) ثبت سرویس (Scheduled Task با حساب SYSTEM) ===" -ForegroundColor Cyan
         $argLine = "`"$dir\chat_server.py`" --port $Port --model $Model"
         if ($VisionModel) { $argLine += " --vision-model $VisionModel" }
         $act = New-ScheduledTaskAction -Execute $python `
@@ -68,19 +91,28 @@ switch ($Action) {
             -Description "LLM Rose - Persian chat server + OpenAI-compatible API" | Out-Null
         Write-Host "سرویس با نام $taskName و حساب SYSTEM ثبت شد (مستقل از لاگین شما؛ بعد از ری‌استارت ویندوز هم خودش بالا می‌آید)."
 
-        Write-Host "=== ۳) اجرای اولیه ===" -ForegroundColor Cyan
+        Write-Host "=== ۴) توقف نسخه قبلی و اجرای کد جدید ===" -ForegroundColor Cyan
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
         Start-ScheduledTask -TaskName $taskName
         Start-Sleep -Seconds 4
         try {
             $h = Invoke-RestMethod "http://localhost:$Port/health" -TimeoutSec 10
-            Write-Host "سرویس فعال است: $($h | ConvertTo-Json -Compress)" -ForegroundColor Green
+            Write-Host "سرویس با کد جدید فعال است: $($h | ConvertTo-Json -Compress)" -ForegroundColor Green
+            Write-Host "(اگر 'model' بالا qwen3:4b و uptime چند ثانیه است، همه‌چیز درست است)"
         }
         catch {
             Write-Host "سرویس هنوز بالا نیامده؛ چند ثانیه بعد با Action=status یا Action=diagnose بررسی کنید." -ForegroundColor Yellow
         }
 
-        Write-Host "`n=== ساخت اولین توکن API ===" -ForegroundColor Cyan
-        & $python "$dir\chat_server.py" add-token --name "first-token"
+        Write-Host "`n=== ۵) توکن API (فقط بار اول) ===" -ForegroundColor Cyan
+        if (Test-Path "$dir\data\tokens.json") {
+            Write-Host "توکن‌ها از قبل موجودند (data\tokens.json) — توکن تکراری ساخته نشد ✓"
+            Write-Host "توکن‌های موجود:  python `"$dir\chat_server.py`" list-tokens"
+            Write-Host "توکن جدید:       python `"$dir\chat_server.py`" add-token --name `"نام-توکن`""
+        } else {
+            & $python "$dir\chat_server.py" add-token --name "first-token"
+        }
         Write-Host "`nآدرس چت:  http://<IP-سرور>:$Port" -ForegroundColor Green
         Write-Host "نکته: اگر فایروال بیرونی (شرکت میزبانی/کلود) دارید، پورت $Port را آنجا هم باز کنید." -ForegroundColor Yellow
     }

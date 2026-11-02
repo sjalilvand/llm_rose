@@ -21,8 +21,8 @@ LLM Rose — سرور چت وب آنلاین + API سازگار با OpenAI هم
   - فقط کتابخانه استاندارد پایتون — بدون نیاز به pip
 
 اجرا:
-    python chat_server.py                          # پورت 8093، مدل qwen3:8b
-    python chat_server.py --port 8093 --model qwen3:8b --ollama http://localhost:11434
+    python chat_server.py                          # پورت 8093، مدل qwen3:4b (سریع برای CPU)
+    python chat_server.py --port 8093 --model qwen3:8b --ollama http://localhost:11434  # کیفیت بالاتر، کندتر
 
 مدیریت توکن:
     python chat_server.py add-token --name "اپ موبایل"
@@ -268,7 +268,7 @@ def load_settings(args):
     s.host = getattr(args, "host", None) or "0.0.0.0"
     s.port = int(getattr(args, "port", None) or cfg.get("port", 8093))
     s.ollama = (getattr(args, "ollama", None) or cfg.get("ollama", "http://localhost:11434")).rstrip("/")
-    s.model = getattr(args, "model", None) or cfg.get("model", "qwen3:8b")
+    s.model = getattr(args, "model", None) or cfg.get("model", "qwen3:4b")  # پیش‌فرض سبک برای CPU؛ کیفیت بالاتر: qwen3:8b
     s.ctx = int(getattr(args, "ctx", None) or cfg.get("ctx", 8192))
     s.max_output_tokens = int(cfg.get("max_output_tokens", 1024))
     s.rate_web_per_min = int(cfg.get("rate_web_per_min", 10))
