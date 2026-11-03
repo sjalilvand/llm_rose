@@ -12,7 +12,7 @@ LLM Rose — سرور چت وب آنلاین + API سازگار با OpenAI هم
   - جستجوی وب (DuckDuckGo) + خواندن خودکار لینک‌ها و افزودن نتیجه به پاسخ با ذکر منابع
   - ایجنت‌های تخصصی روان‌شناسی: بالینی، خانواده و زوج، کودک و نوجوان، CBT، تحصیلی/شغلی، همراه بحران
   - اجرای کد HTML/JS داخل صفحه، رندر نمودار فرایند (زیرمجموعه mermaid)، کپی پیام‌ها و کدها
-  - بهینه‌سازی سرعت روی CPU: keep_alive دائمی، حذف حالت تفکر، بودجه متن تاریخچه
+  - بهینه‌سازی سرعت روی CPU: حذف کامل بلوک تفکر (فیلتر <think> + /no_think)، keep_alive بیست دقیقه‌ای، بودجه متن تاریخچه
   - هویت «دستیار هوش مصنوعی مرکز مشاور رز» + پاسخ خودکار از محتوای وب‌سایت مرکز
     (پایگاه دانش خودکار از صفحه اصلی، باندل JS سایت و APIهای عمومی — ماژول site_kb.py)
   - API سازگار با OpenAI:  POST /v1/chat/completions  و  GET /v1/models
@@ -120,7 +120,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "«من دستیار هوش مصنوعی مرکز مشاور رز هستم؛ برای راهنمایی درباره خدمات مشاوره و روان‌درمانی، "
     "نوبت‌دهی آنلاین، شعبه‌ها و پاسخ به پرسش‌های شما در خدمتم.»\n"
     "قواعد پاسخ‌گویی:\n"
-    "۱) همیشه فارسی، کوتاه، گرم و حرفه‌ای بنویس.\n"
+    "۱) همیشه و فقط به فارسیِ روان و درست بنویس؛ هرگز جملهٔ انگلیسی در پاسخ ننویس "
+    "(به‌جز نام‌های خاص، نشانی وب و اصطلاحات فنی داخل کد). پاسخ کامل و منظم بده، نه تکه‌تکه.\n"
     "۲) درباره خدمات، قیمت‌ها، شعبه‌ها و نوبت‌دهی فقط از «اطلاعات رسمی وب‌سایت» که در پیام سامانه ارسال می‌شود "
     "استفاده کن؛ عدد، قیمت یا آدرس از خودت نساز.\n"
     "۳) اگر پاسخ در اطلاعات رسمی نبود، صادقانه بگو و کاربر را به فرم درخواست مشاوره در سایت یا تماس با پذیرش هدایت کن.\n"
@@ -730,13 +731,63 @@ def fetch_page_text(url, max_chars=1400, timeout=9):
 # =====================================================================
 # ارتباط با Ollama
 # =====================================================================
+_THINK_OPEN, _THINK_CLOSE = "<think>", "</think>"
+
+
+def _partial_suffix_len(text, tag):
+    """بلندترین پسوندِ متن که پیشوندِ تگ است (برای تگ‌های بریده‌شده بین دو chunk)"""
+    for n in range(min(len(text), len(tag) - 1), 0, -1):
+        if tag.startswith(text[-n:]):
+            return n
+    return 0
+
+
+def _make_think_filter():
+    """وضعیت فیلتر حذف بلوک‌های تفکر از جریان پاسخ (برای هر درخواست جدید)"""
+    return {"mode": "normal", "hold": ""}
+
+
+def _think_filter_feed(st, piece):
+    """حذف <think>…</think> از جریان متن. مدل qwen3 روی Ollamaهای قدیمی‌تر از ۰٫۹
+    حتی با think:false بلوک تفکر (معمولاً انگلیسی) داخل خود متن می‌فرستد؛
+    این فیلتر آن را قبل از رسیدن به کاربر پاک می‌کند."""
+    out = []
+    st["hold"] += piece
+    while st["hold"]:
+        if st["mode"] == "normal":
+            i = st["hold"].find(_THINK_OPEN)
+            if i >= 0:
+                out.append(st["hold"][:i])
+                st["hold"] = st["hold"][i + len(_THINK_OPEN):]
+                st["mode"] = "think"
+                continue
+            keep = _partial_suffix_len(st["hold"], _THINK_OPEN)
+            if keep:
+                out.append(st["hold"][:-keep])
+                st["hold"] = st["hold"][-keep:]
+            else:
+                out.append(st["hold"])
+                st["hold"] = ""
+            break
+        else:  # mode == "think" → همه‌چیز تا بسته‌شدن تگ دور ریخته می‌شود
+            i = st["hold"].find(_THINK_CLOSE)
+            if i >= 0:
+                st["hold"] = st["hold"][i + len(_THINK_CLOSE):]
+                st["mode"] = "normal"
+                continue
+            keep = _partial_suffix_len(st["hold"], _THINK_CLOSE)
+            st["hold"] = st["hold"][-keep:] if keep else ""
+            break
+    return "".join(out)
+
+
 def ollama_chat_stream(settings, messages, num_predict, model=None):
     payload = {
         "model": model if model and MODEL_RE.fullmatch(model) else settings.model,
         "messages": messages,
         "stream": True,
-        "think": False,  # پاسخ سریع روی CPU؛ برای سرعت حالت تفکر خاموش است
-        "keep_alive": -1,  # مدل همیشه در RAM بماند؛ حذف تأخیر ~۱۰ ثانیه‌ایِ بارگذاری مجدد
+        "think": False,  # روی Ollama ۰٫۹+ تفکر را خاموش می‌کند (نسخه‌های قدیمی‌تر نادیده می‌گیرند)
+        "keep_alive": "20m",  # نه دائمی (پرشدن RAM با چند مدل و کندی شدید)، نه کوتاه (لود سرد مکرر)
         "options": {
             "num_ctx": settings.ctx,
             "temperature": 0.7,
@@ -752,15 +803,30 @@ def ollama_chat_stream(settings, messages, num_predict, model=None):
         method="POST",
     )
     resp = urlreq.urlopen(req, timeout=600)
+    fstate = _make_think_filter()
     try:
         for raw in resp:
             line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
-                yield json.loads(line)
+                obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            msg = obj.get("message")
+            if isinstance(msg, dict):
+                c = msg.get("content") or ""
+                if c:
+                    clean = _think_filter_feed(fstate, c)
+                    if not clean:
+                        continue  # کل این تکه داخل بلوک تفکر بود
+                    msg["content"] = clean
+                elif obj.get("done") and fstate["hold"]:
+                    # پایان جریان؛ باقیمانده بافر (اگر در حالت عادی است) باید بیرون بیاید
+                    if fstate["mode"] == "normal":
+                        msg["content"] = fstate["hold"]
+                    fstate["hold"] = ""
+            yield obj
     finally:
         resp.close()
 
@@ -1822,6 +1888,8 @@ def build_handler(settings, store, limiter, boot_ts, hist):
             web_ctx, sources = self._web_block(last_user, force_search)
             if web_ctx:
                 base += web_ctx
+            # کلید نرم qwen3: تولید بلوک تفکر (که معمولاً انگلیسی است و سرعت را می‌کُشد) را کلاً خاموش می‌کند
+            base += "\n\n/no_think"
             return base, sources
 
         def _web_block(self, last_user, force_search):

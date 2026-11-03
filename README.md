@@ -61,7 +61,7 @@ winget install Ollama.Ollama
 
 ```powershell
 [Environment]::SetEnvironmentVariable("OLLAMA_HOST","0.0.0.0","Machine")          # دسترسی از شبکه
-[Environment]::SetEnvironmentVariable("OLLAMA_KEEP_ALIVE","-1","Machine")          # مدل همیشه در RAM بماند
+[Environment]::SetEnvironmentVariable("OLLAMA_KEEP_ALIVE","20m","Machine")          # مدل ۲۰ دقیقه بعد از بی‌کاری از RAM خارج می‌شود
 [Environment]::SetEnvironmentVariable("OLLAMA_NUM_PARALLEL","1","Machine")         # یک درخواست همزمان (صرفه‌جویی RAM)
 [Environment]::SetEnvironmentVariable("OLLAMA_MAX_LOADED_MODELS","1","Machine")    # فقط یک مدل لود شود
 [Environment]::SetEnvironmentVariable("OLLAMA_FLASH_ATTENTION","1","Machine")      # کاهش مصرف RAM کش
@@ -186,7 +186,7 @@ services:
     ports: ["11434:11434"]
     volumes: ["ollama_data:/root/.ollama"]
     environment:
-      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_KEEP_ALIVE=20m
       - OLLAMA_NUM_PARALLEL=1
       - OLLAMA_FLASH_ATTENTION=1
       - OLLAMA_KV_CACHE_TYPE=q8_0
@@ -221,7 +221,7 @@ ollama run dorna2
 - **سرعت انتظاری:** برای Qwen3-8B با کوانتیزه Q4 روی این سرور حدود ۶ تا ۱۲ توکن بر ثانیه. برای پاسخ سریع‌تر حتماً `think:false` را فعال کنید یا از `qwen3:4b` استفاده کنید.
 - **RAM:** با `OLLAMA_KV_CACHE_TYPE=q8_0` و `OLLAMA_FLASH_ATTENTION=1` مصرف RAM حافظه موقت تقریباً نصف می‌شود.
 - **همزمانی:** روی CPU تعداد درخواست موازی را روی ۱ نگه دارید (`OLLAMA_NUM_PARALLEL=1`)؛ صف‌بندی درخواست‌ها تجربه بهتری می‌دهد.
-- **بقا در حافظه:** `OLLAMA_KEEP_ALIVE=-1` باعث می‌شود مدل همیشه در RAM بماند و هر درخواست ۱۰ تا ۳۰ ثانیه تأخیر بارگذاری نداشته باشد.
+- **بقا در حافظه:** `OLLAMA_KEEP_ALIVE=20m` مدل را تا ۲۰ دقیقه بعد از آخرین درخواست در RAM نگه می‌دارد (بدون تأخیر بارگذاری) و بعد آزاد می‌کند تا با وجود چند مدل (چت + بینایی + 8b) حافظه پر نشود و سیستم دچار swap و کندی شدید نشود.
 - **قبل از نصب مدل ۱۲B یا ۱۴B:** Docker Desktop و ClamAV را ببندید تا حدود ۱۱GB RAM آزاد شود.
 
 ## ۷) برنامه تست سرعت و کیفیت (Benchmark)
@@ -318,7 +318,7 @@ powershell -ExecutionPolicy Bypass -File chat_server\install_service.ps1 -Action
 ```
 
 - **مدل پیش‌فرض نصب‌کننده `qwen3:4b` است** (سریع برای CPU، حدود ۲ برابر سریع‌تر از 8b). برای کیفیت بالاتر: `-Model qwen3:8b`. اگر مدل روی Ollama نباشد، نصب‌کننده خودش آن را یک‌بار دانلود می‌کند.
-- `-SetOllamaEnv` متغیرهای بهینه (`OLLAMA_KEEP_ALIVE=-1` و ...) را ثبت می‌کند تا مدل همیشه در RAM بماند و تأخیر ۱۱ ثانیه‌ای پاسخ اول حذف شود. **برای تأثیر کامل، بعد از اجرای این فرمان یک بار Ollama را هم ری‌استارت کنید** (یا سرور را). اگر قبلاً بدون این سوییچ نصب کرده‌اید، همین فرمان را دوباره بزنید و Ollama را ری‌استارت کنید.
+- `-SetOllamaEnv` متغیرهای بهینه (`OLLAMA_KEEP_ALIVE=20m` و ...) را ثبت می‌کند؛ تأخیر بارگذاری در استفاده پیوسته حذف می‌شود و RAM هم آزاد می‌ماند. **برای تأثیر کامل، بعد از اجرای این فرمان یک بار Ollama را هم ری‌استارت کنید** (یا سرور را). اگر قبلاً بدون این سوییچ نصب کرده‌اید، همین فرمان را دوباره بزنید و Ollama را ری‌استارت کنید.
 - **نصب‌کننده همیشه نسخه قبلی سرویس را متوقف و کد جدید را اجرا می‌کند**؛ یعنی بعد از هر `git pull` کافی است همین فرمان install را دوباره بزنید (ری‌استارت جدا لازم نیست). توکن‌های قبلی حفظ می‌شوند و توکن تکراری ساخته نمی‌شود.
 - برای فعال‌کردن تحلیل عکس، مدل بینایی را یک بار بکشید و سرویس را با آن نصب کنید:
 
@@ -389,7 +389,8 @@ curl http://130.185.73.157:8093/v1/chat/completions \
 | سایت چت یا `/health` باز نمی‌شود (ERR_CONNECTION_TIMED_OUT) | روی سرور: `powershell -ExecutionPolicy Bypass -File chat_server\install_service.ps1 -Action diagnose -Port 8093`. اگر سرویس اجرا نیست: `-Action restart`. اگر همه موارد سبز بود، پورت 8093 را در پنل فایروال شرکت میزبانی هم باز کنید |
 | سرویس بعد از بستن RDP یا ری‌استارت ویندوز از کار افتاده | نسخه‌های قدیمی نصب‌کننده، تسک را با حساب کاربری ثبت می‌کردند. یک بار `-Action install` را دوباره اجرا کنید تا سرویس با حساب SYSTEM ثبت شود |
 | خطای کمبود RAM هنگام لود مدل | مدل کوچک‌تر (`qwen3:4b`)، بستن Docker/ClamAV، کاهش `OLLAMA_CONTEXT_LENGTH` به 4096 |
-| پاسخ‌دهی خیلی کند | ۱) در `/health` ببینید `model` همان `qwen3:4b` است (نه 8b)؛ ۲) یک بار ویندوز/Ollama را ری‌استارت کنید تا `OLLAMA_KEEP_ALIVE=-1` اعمال شود (حذف تأخیر ۱۱ ثانیه‌ای)؛ ۳) در صفحه چت مدل را روی `qwen3:4b` بگذارید؛ ۴) برنامه‌های سنگین دیگر (Docker/آنتی‌ویروس اسکنر) را ببندید |
+| پاسخ‌دهی خیلی کند | ۱) در `/health` ببینید `model` همان `qwen3:4b` است (نه 8b)؛ ۲) یک بار Ollama/ویندوز را ری‌استارت کنید تا `OLLAMA_KEEP_ALIVE=20m` اعمال شود؛ ۳) در صفحه چت مدل را روی `qwen3:4b` بگذارید؛ ۴) برنامه‌های سنگین دیگر (Docker/آنتی‌ویروس) را ببندید؛ ۵) چند مدل را هم‌زمان امتحان نکنید — هر مدل چند GB RAM می‌خواهد |
+| پاسخ با متن انگلیسی/تفکر داخل جواب می‌آید | نسخه‌های جدید سرور بلوک `<think>` را حذف و `/no_think` را به پرامپت اضافه می‌کنند؛ با `git pull` و نصب دوباره (`-Action install`) به‌روزرسانی کنید. اگر باز ماند، Ollama را هم به‌روزرسانی کنید (`winget upgrade Ollama.Ollama`) |
 | از سیستم دیگر به API دسترسی نیست | بررسی `OLLAMA_HOST=0.0.0.0`، قانون فایروال پورت 11434، ری‌استارت Ollama |
 | خطای illegal instruction هنگام اجرا | CPU مجازی QEMU ممکن است دستورهای AVX2 را پاس نداده باشد؛ تنظیم CPU میزبان را روی host-passthrough بگذارید |
 | پورت 11434 اشغال است | برنامه دیگری روی این پورت را پیدا و متوقف کنید یا `OLLAMA_HOST=0.0.0.0:11435` بگذارید |

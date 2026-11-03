@@ -9,7 +9,7 @@
     Action=diagnose  عیب‌یابی گام‌به‌گام وقتی سایت/API بالا نمی‌آید
     Action=remove    حذف سرویس
     Action=status    وضعیت سرویس
-    -SetOllamaEnv    تنظیم OLLAMA_KEEP_ALIVE=-1 و بهینه‌سازی RAM (باعث می‌شود مدل همیشه در RAM بماند)
+    -SetOllamaEnv    تنظیم OLLAMA_KEEP_ALIVE=20m و بهینه‌سازی RAM (مدل بعد از ۲۰ دقیقه بی‌کاری از RAM خارج می‌شود)
 .EXAMPLES
     powershell -ExecutionPolicy Bypass -File install_service.ps1 -Action install -Port 8093 -SetOllamaEnv
     powershell -ExecutionPolicy Bypass -File install_service.ps1 -Action restart -Port 8093
@@ -51,8 +51,8 @@ function Ensure-Model([string]$m) {
 }
 
 if ($SetOllamaEnv) {
-    Write-Host "تنظیم متغیرهای بهینه Ollama (KEEP_ALIVE / FLASH_ATTENTION / KV_CACHE)..." -ForegroundColor Cyan
-    [Environment]::SetEnvironmentVariable("OLLAMA_KEEP_ALIVE", "-1", "Machine")
+    Write-Host "تنظیم متغیرهای بهینه Ollama (KEEP_ALIVE=20m / FLASH_ATTENTION / KV_CACHE)..." -ForegroundColor Cyan
+    [Environment]::SetEnvironmentVariable("OLLAMA_KEEP_ALIVE", "20m", "Machine")
     [Environment]::SetEnvironmentVariable("OLLAMA_FLASH_ATTENTION", "1", "Machine")
     [Environment]::SetEnvironmentVariable("OLLAMA_KV_CACHE_TYPE", "q8_0", "Machine")
     [Environment]::SetEnvironmentVariable("OLLAMA_CONTEXT_LENGTH", "8192", "Machine")
