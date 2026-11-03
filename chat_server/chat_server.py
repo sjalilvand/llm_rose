@@ -1811,6 +1811,10 @@ def build_handler(settings, store, limiter, boot_ts, hist):
                 role = m.get("role")
                 content = m.get("content")
                 if role in ("system", "user", "assistant") and isinstance(content, str):
+                    if role == "assistant":
+                        # تاریخچهٔ پاسخ‌ها کوتاه نگه داشته می‌شود: هم سهم CPU کمتر،
+                        # هم جلوی تقلید از پاسخ‌های قدیمیِ آلوده به متن تفکر انگلیسی گرفته می‌شود
+                        content = content[:800]
                     out = {"role": role, "content": content[:max_chars]}
                     if role == "user":
                         # عکس‌ها برای مدل‌های بینایی به Ollama پاس داده می‌شوند
